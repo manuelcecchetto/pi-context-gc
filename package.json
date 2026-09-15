@@ -1,0 +1,72 @@
+{
+  "name": "pi-context-gc",
+  "version": "0.1.1",
+  "type": "module",
+  "description": "Agent-triggered semantic context garbage collection for Pi, backed by OpenAI-native Responses compaction with Pi's normal overflow safeguards intact.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "context-gc",
+    "compaction",
+    "openai",
+    "codex",
+    "agent"
+  ],
+  "files": [
+    "index.ts",
+    "scheduler-only.ts",
+    "src",
+    "docs",
+    "README.md",
+    "AGENTS.md",
+    "NOTICE.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    ".gitignore",
+    "test",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "vendor"
+  ],
+  "pi": {
+    "extensions": [
+      "./vendor/pi-better-compaction/index.ts",
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "npm run build && node --test --test-concurrency=1 test/*.test.mjs",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.0",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.84.2",
+    "@earendil-works/pi-ai": "0.84.2",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "typebox": "1.3.7"
+  },
+  "exports": {
+    ".": "./index.ts",
+    "./scheduler-only": "./scheduler-only.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "author": "Manuel Cecchetto",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manuelcecchetto/pi-context-gc.git"
+  },
+  "homepage": "https://github.com/manuelcecchetto/pi-context-gc#readme",
+  "bugs": {
+    "url": "https://github.com/manuelcecchetto/pi-context-gc/issues"
+  }
+}
