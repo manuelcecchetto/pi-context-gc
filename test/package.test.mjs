@@ -11,3 +11,14 @@ test('published entrypoints load through the real Pi extension loader', async ()
   assert.equal(loaded.extensions.length, 2);
   assert.ok(loaded.extensions.some(extension => extension.tools.has('compact_context')));
 });
+
+
+test('distribution includes the explicit runtime prerequisite and its upstream license', async () => {
+  const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.ok(manifest.files.includes('patches'));
+  const patch = await readFile(new URL('../patches/pi-1.0.0-semantic-compaction.patch', import.meta.url), 'utf8');
+  assert.match(patch, /requestCompaction/);
+  assert.match(patch, /agent-session-boundaries\.test\.ts/);
+  const license = await readFile(new URL('../patches/PI-LICENSE', import.meta.url), 'utf8');
+  assert.match(license, /Copyright \(c\) 2025 Mario Zechner/);
+});

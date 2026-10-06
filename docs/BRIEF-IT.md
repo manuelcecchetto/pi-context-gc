@@ -1,5 +1,7 @@
 # Brief: Garbage Context Collection semantica per Pi
 
+> Historical design record for the original Pi 0.84.x abort/resume implementation. The current unreleased design requires atomic `requestCompaction`; see [ARCHITECTURE.md](ARCHITECTURE.md) and [COMPATIBILITY.md](COMPATIBILITY.md). The lifecycle descriptions below are not current implementation guidance.
+
 ## Conclusione esecutiva
 
 La via migliore, oggi, è **un'estensione separata che decide quando compattare**, senza implementare un nuovo compactor e senza sostituire i meccanismi di sicurezza di Pi.

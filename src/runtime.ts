@@ -4,6 +4,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { buildCompactionInstructions, buildResumeMessage } from "./instructions.ts";
+import { hasBoundaryCompaction } from "./host.ts";
 import { getTrailingCompleteToolResultBatch } from "./tool-batches.ts";
 import {
   CHECKPOINT_ENTRY_TYPE,
@@ -22,11 +23,14 @@ export function createRuntimeState(): RuntimeState {
     checkpoint: undefined,
     lastError: undefined,
     lastCompletedCheckpointId: undefined,
+    cancelRequest: undefined,
   };
 }
 
 export function resetRuntime(runtime: RuntimeState): void {
   runtime.generation += 1;
+  runtime.cancelRequest?.();
+  runtime.cancelRequest = undefined;
   runtime.phase = "idle";
   runtime.checkpoint = undefined;
   runtime.lastError = undefined;
@@ -161,17 +165,10 @@ function settleFailure(
   notify(
     ctx,
     config,
-    `compaction failed: ${message}. The interrupted run was not resumed. Use /context-gc retry or /context-gc resume.`,
+    `compaction failed: ${message}. No automatic continuation was requested. Use /context-gc retry or /context-gc resume.`,
     "error",
     true,
   );
-
-  if (config.resumeOnFailure) {
-    setImmediate(() => {
-      if (runtime.phase !== "failed" || runtime.checkpoint?.id !== checkpoint.id) return;
-      resumeCheckpoint(pi, ctx, runtime, config, "automatic failure fallback");
-    });
-  }
 }
 
 function dispatchCheckpointResume(
@@ -188,7 +185,7 @@ function dispatchCheckpointResume(
     pi.sendMessage(
       {
         customType: RESUME_MESSAGE_TYPE,
-        content: [buildResumeMessage(checkpoint), "", `Continuation reason: ${reason}`].join("\n"),
+        content: [buildResumeMessage(checkpoint, runtime.lastCompletedCheckpointId === checkpoint.id), "", `Continuation reason: ${reason}`].join("\n"),
         display: false,
         details: {
           checkpointId: checkpoint.id,
@@ -216,85 +213,10 @@ function dispatchCheckpointResume(
   return true;
 }
 
-function finishAndMaybeResume(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  runtime: RuntimeState,
-  config: ContextGcConfig,
-  checkpoint: ContextCheckpoint,
-  generation: number,
-): void {
-  if (
-    runtime.generation !== generation ||
-    runtime.phase !== "resume-pending" ||
-    runtime.checkpoint?.id !== checkpoint.id ||
-    !sameSession(ctx, checkpoint.sessionId)
-  ) {
-    return;
-  }
-
-  let idle = false;
-  try {
-    idle = ctx.isIdle();
-  } catch (error) {
-    settleFailure(pi, ctx, runtime, config, checkpoint, `unable to inspect continuation state: ${errorText(error)}`);
-    return;
-  }
-
-  if (!config.autoResume) {
-    // Keep the checkpoint live so `/context-gc resume` can materialize it later.
-    setStatus(ctx, config, "resume pending");
-    notify(
-      ctx,
-      config,
-      "compaction completed; automatic resume is disabled. Use /context-gc resume when ready.",
-      "info",
-    );
-    return;
-  }
-
-  let hasPendingMessages = false;
-  try {
-    hasPendingMessages = ctx.hasPendingMessages();
-  } catch {
-    // Older compatible hosts may not expose reliable queue inspection.
-  }
-
-  if (!idle || hasPendingMessages) {
-    appendCheckpointEntry(pi, checkpoint, "continued-by-existing-turn", {
-      idle,
-      hasPendingMessages,
-    });
-    runtime.generation += 1;
-    runtime.phase = "idle";
-    runtime.checkpoint = undefined;
-    runtime.lastError = undefined;
-    setStatus(ctx, config, undefined);
-    notify(
-      ctx,
-      config,
-      "compaction completed; an existing queued turn already owns continuation.",
-      "info",
-    );
-    return;
-  }
-
-  if (dispatchCheckpointResume(
-    pi,
-    ctx,
-    runtime,
-    config,
-    checkpoint,
-    "semantic phase-boundary compaction completed",
-  )) {
-    notify(ctx, config, "compaction completed; resumed from the task checkpoint.", "info");
-  }
-}
-
 /**
- * Start one Pi-owned compaction. Pi aborts the active low-level run, then enters
- * its standard manual compaction pipeline. Any installed session_before_compact
- * backend therefore handles both this request and Pi's normal safety triggers.
+ * Request Pi-owned compaction at the next pre-provider boundary. The host owns
+ * atomic history/ledger installation and continuation; this never aborts the
+ * parent or starts a competing resume turn.
  */
 export function startCompaction(
   pi: ExtensionAPI,
@@ -308,6 +230,11 @@ export function startCompaction(
   if (!sameSession(ctx, checkpoint.sessionId)) {
     runtime.phase = "failed";
     runtime.lastError = "active session changed before compaction";
+    return false;
+  }
+
+  if (!hasBoundaryCompaction(ctx)) {
+    settleFailure(pi, ctx, runtime, config, checkpoint, "host requires requestCompaction boundary API");
     return false;
   }
 
@@ -336,12 +263,17 @@ export function startCompaction(
   };
 
   try {
-    const compact = ctx.compact as (
-      options: NonNullable<Parameters<typeof ctx.compact>[0]> & { force: boolean },
-    ) => void;
-    compact({
+    const request = ctx.requestCompaction({
       force: true,
       customInstructions: buildCompactionInstructions(checkpoint),
+      continuation: {
+        customType: RESUME_MESSAGE_TYPE,
+        content: buildResumeMessage(checkpoint),
+        display: false,
+        details: { checkpointId: checkpoint.id, nextFocus: checkpoint.input.next_focus },
+      },
+      autoResume: config.autoResume,
+      resumeOnFailure: config.resumeOnFailure,
       onComplete: (result) => {
         if (!claim()) return;
         runtime.phase = "resume-pending";
@@ -355,15 +287,36 @@ export function startCompaction(
           },
         });
 
-        // Pi flushes queued input from its compaction-end handler. Defer one
-        // event-loop turn so ctx.isIdle() reflects any turn already started.
-        setImmediate(() => finishAndMaybeResume(pi, ctx, runtime, config, checkpoint, generation));
+        runtime.cancelRequest = undefined;
+        if (config.autoResume) {
+          appendCheckpointEntry(pi, checkpoint, "continued-by-existing-turn");
+          runtime.phase = "idle";
+          runtime.checkpoint = undefined;
+          setStatus(ctx, config, undefined);
+        } else {
+          notify(ctx, config, "compaction completed; use /context-gc resume when ready.", "info");
+        }
       },
       onError: (error) => {
         if (!claim()) return;
-        settleFailure(pi, ctx, runtime, config, checkpoint, errorText(error));
+        runtime.cancelRequest = undefined;
+        if (config.resumeOnFailure && error.name !== "AbortError") {
+          appendCheckpointEntry(pi, checkpoint, "failed", { error: errorText(error) });
+          runtime.phase = "idle";
+          runtime.checkpoint = undefined;
+          runtime.lastError = errorText(error);
+          setStatus(ctx, config, undefined);
+          notify(ctx, config, `compaction failed: ${errorText(error)}; host continuing with the checkpoint.`, "warning", true);
+        } else {
+          settleFailure(pi, ctx, runtime, config, checkpoint, errorText(error));
+        }
       },
     });
+    if (!request.accepted) {
+      if (claim()) settleFailure(pi, ctx, runtime, config, checkpoint, "host declined boundary compaction request");
+      return false;
+    }
+    if (!callbackSettled) runtime.cancelRequest = () => request.cancel();
   } catch (error) {
     if (!callbackSettled) callbackSettled = true;
     if (runtime.generation === generation && sameSession(ctx, checkpoint.sessionId)) {
@@ -376,7 +329,7 @@ export function startCompaction(
 }
 
 /** Trigger only when the checkpoint tool result belongs to a complete trailing batch. */
-export function maybeStartAtContextBoundary(
+export function maybeStartAtTurnBoundary(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   runtime: RuntimeState,
@@ -389,6 +342,22 @@ export function maybeStartAtContextBoundary(
   return startCompaction(pi, ctx, runtime, config);
 }
 
+/** New user intent supersedes checkpoint state even if compaction is already in flight. */
+export function supersedeCheckpoint(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  runtime: RuntimeState,
+  config: ContextGcConfig,
+): void {
+  const checkpoint = runtime.checkpoint;
+  if (!checkpoint) return;
+  // Invalidate first: cancel may synchronously notify observers. A false return
+  // means the host already owns the work, not that the old task is still current.
+  resetRuntime(runtime);
+  appendCheckpointEntry(pi, checkpoint, "cancelled", { reason: "superseded by new user input" });
+  setStatus(ctx, config, undefined);
+}
+
 export function cancelPending(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -397,8 +366,10 @@ export function cancelPending(
   reason: string,
 ): boolean {
   const checkpoint = runtime.checkpoint;
-  if (!checkpoint || !["pending", "failed", "resume-pending"].includes(runtime.phase)) return false;
+  if (!checkpoint) return false;
+  if (runtime.phase === "compacting" && !runtime.cancelRequest?.()) return false;
   appendCheckpointEntry(pi, checkpoint, "cancelled", { reason });
+  runtime.cancelRequest = undefined;
   runtime.generation += 1;
   runtime.phase = "idle";
   runtime.checkpoint = undefined;

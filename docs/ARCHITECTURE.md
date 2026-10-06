@@ -1,148 +1,47 @@
 # Architecture
 
-## Ownership boundaries
+## Ownership
 
-`pi-context-gc` intentionally does not implement a compactor.
+- The model chooses the semantic boundary and provides a bounded checkpoint.
+- The scheduler validates the complete persisted tool batch at `turn_end` and requests compaction once.
+- Pi owns the atomic pre-provider boundary, normal compaction backend, history installation, canonical message persistence and continuation.
+- Native/backend extensions own how the summary or opaque representation is produced. Threshold and overflow safeguards remain intact.
 
-| Layer | Owner | Responsibility |
-|---|---|---|
-| Semantic phase decision | model via `compact_context` | Decide that the previous working set is dead and emit a bounded task/search/completion checkpoint |
-| Safe scheduling | this extension | Wait for a complete tool batch, trigger once, guard session/race state, and resume |
-| Compaction lifecycle | Pi | Abort the active run, prepare branch history, dispatch hooks, persist compaction, rebuild agent context |
-| Native representation | OpenAI backend | Produce and replay the opaque encrypted compaction item |
-| Safety fallback | Pi + backend | Keep threshold/overflow triggers and Pi text compaction available |
+`ctx.requestCompaction` is an explicit host capability, not an alias for `ctx.compact`. Stock Pi 1.0.0 lacks it; unsupported hosts reject the tool before scheduling. See COMPATIBILITY.md.
 
-Core invariant:
+## Lifecycle
 
 ```text
-scheduler owns WHEN
-backend owns HOW
-Pi owns persistence and hard safety
+IDLE -> PENDING (tool returns normally)
+     -> COMPACTING (turn_end validates every result and exact checkpoint ID)
+     -> host pre-provider boundary, standard backend, history + ledger persisted
+     -> IDLE (host continues current parent run)
+     or RESUME_PENDING (autoResume=false; explicit /resume)
+     or FAILED (default failure policy; /retry, /resume or /cancel)
 ```
 
-## Pi lifecycle finding
+The scheduler passes the complete hidden `pi-context-gc-resume` custom message with the request. Runtime callbacks update diagnostic state only; they do not schedule model turns. Generation, session ID, checkpoint ID and phase guards reject stale/duplicate callbacks. New user input cancels an unconsumed request. Shutdown invalidates callbacks and cancels queued intent.
 
-Pi's low-level `agent.prompt()` owns repeated model/tool rounds. In the current coding-agent path, normal threshold/overflow checks are reached in post-run/pre-prompt handling rather than after every tool batch.
+## Background subagents
 
-Extensions receive a `context` event before every provider call. The scheduler uses that event as the nearest public mid-run boundary.
+The parent remains active while Pi awaits compaction. Independent workers continue; this boundary never waits for their completion or cancels them. Their notifications queue normally. No artificial `agent_settled` event is emitted to hand off compaction, so notifications cannot overtake it and launch a second parent run.
 
-## State machine
+A configured pause or failure stops the current loop before another provider call. Messages already selected from a queue are persisted normally; messages arriving during compaction remain queued. This is not a global session lock: later independent user input or extension notifications may start a new run using the already-persisted checkpoint. The runtime contract, not a scheduler-side `isIdle()` check, owns this ordering.
 
-```text
-IDLE
-  | compact_context tool
-  v
-PENDING
-  | context/idle boundary contains complete batch with exact toolCallId
-  v
-COMPACTING
-  | onComplete                         | onError
-  v                                    v
-RESUME_PENDING                         FAILED
-  | autoResume + idle                  | /retry -> COMPACTING
-  |                                    | /resume -> continuation
-  | /resume when autoResume=false      | /cancel -> IDLE
-  v
-IDLE + hidden continuation
-```
+## Why not `context` or manual compaction?
 
-A generation counter invalidates stale callbacks after cancellation, session replacement, or shutdown.
+The former `context -> ctx.compact -> abort -> settled -> resume` path was racy. A settled listener could flush a subagent notification, starting a complete parent run while manual compaction still awaited idle. It also surfaced the intentional abort as a model error. Checking queues one event-loop tick later could suppress the canonical ledger without preventing the competing run.
 
-## Why the tool cannot call `ctx.compact()` directly
+`context` is also too late for a request consumed by the pre-provider preparation hook. `turn_end` supplies the completed assistant/tool-result batch after persistence and before that hook. No idle/settled fallback or legacy abort path is retained.
 
-Pi manual compaction begins by aborting the current agent operation. Starting it inside custom-tool execution can race with persistence of that result and sibling results.
+## Persistence and recovery
 
-The tool therefore records intent and returns normally. The next `context` event verifies:
+The tool call/result remains in the audit history. Pi's compaction entry defines replacement context. The hidden canonical checkpoint participates in model context, while diagnostic checkpoint entries do not. Pi must persist the canonical message before invoking completion callbacks and before any next model call, even when automatic continuation is disabled.
 
-- the tail ends in tool-result messages;
-- one assistant tool-call message directly precedes them;
-- every call ID has exactly one finalized result;
-- no result ID is duplicated;
-- the exact `compact_context` call ID is present.
+Manual recovery injects the full checkpoint, not only `next_focus`. Recovery text never asserts that failed compaction succeeded. `/retry` requests the same standard host pipeline from idle; `/cancel` clears scheduler state and, when still pending, cancels the host intent.
 
-Only then is `ctx.compact({ force: true })` invoked. `force` is a compatibility hint for hosts that implement forced preparation. Stock Pi 0.84.2 ignores it and retains its normal eligibility gate; this package does not patch Pi. Automatic, overflow, and interactive `/compact` behavior remains unchanged.
+## Backend and data bounds
 
-An `agent_settled` fallback exists for an unusual early termination, but it applies the same validation against persisted `buildContextEntries()` data. It never bypasses the complete-batch invariant.
+The bundled MIT `pi-better-compaction` backend remains unchanged: Responses native compaction, documented Codex remote-compaction fallback, then Pi text fallback. The scheduler never handles provider credentials or implements another summarizer.
 
-## Native backend composition
-
-The package manifest loads the bundled `@lll9p/pi-better-compaction` extension before this scheduler. On supported Responses-family APIs, the backend intercepts `session_before_compact`, calls `/responses/compact`, stores the opaque window in the Pi compaction entry, and rewrites later provider requests to replay it. For ChatGPT-authenticated Codex, where the standalone compact route returns 404, the bundled backend uses Codex remote-compaction v2 by appending `compaction_trigger` to the regular Responses stream with `store: false`.
-
-If native handling fails, the backend yields to Pi's normal text compaction. Since manual, threshold, and overflow compaction all enter Pi's standard lifecycle, they share the backend.
-
-This is the best deployable route for current Pi 0.84.x, but it is not identical to Codex's current internal remote-compaction-v2 rollover.
-
-## Bounded checkpoint
-
-Required:
-
-- `completed_phase` — max 2,000 characters;
-- `next_focus` — max 2,000 characters;
-- `keep` — 1–16 items, max 1,000 characters each;
-- `verification` — 1–12 items, max 1,000 characters each.
-
-Optional:
-
-- `open_loops` — up to 12 items;
-- `ruled_out` — up to 12 items.
-
-The bounds prevent the checkpoint from becoming another transcript. `verification` is mandatory so a phase boundary carries evidence of completion.
-
-## Compaction guidance
-
-The extension passes concise `customInstructions` to Pi. They preserve:
-
-- user intent and acceptance criteria;
-- decisions, invariants, edits, identifiers and paths;
-- unresolved dependencies;
-- negative search state;
-- verification state.
-
-They mark raw logs, repeated reads, superseded snapshots and completed exploration as disposable unless needed to support retained state. They are a handoff contract, not a replacement summary.
-
-## Resume path
-
-Manual Pi compaction does not continue the interrupted run. On success, the extension waits one event-loop turn and checks:
-
-- generation, session ID and checkpoint ID still match;
-- Pi is idle;
-- no queued continuation already exists.
-
-It then injects one hidden custom message with `triggerTurn: true`. The message materializes the canonical task/search/completion ledger; the opaque provider item carries broader latent continuity.
-
-If `autoResume=false`, state remains `RESUME_PENDING` until `/context-gc resume` or `/context-gc cancel`.
-
-If another turn already owns continuation, the extension records that fact and does not create a duplicate turn.
-
-## Persistence
-
-Three artifacts are distinct:
-
-1. normal tool call/result — participates in the pre-compaction conversation;
-2. Pi compaction entry — authoritative replacement state, including native opaque details when supported;
-3. custom checkpoint entries — diagnostic state outside model context.
-
-The hidden resume message participates in model context and is persisted as a custom message.
-
-## Failure semantics
-
-- native backend failure may fall through to Pi text compaction;
-- total compaction failure sets `FAILED` and does not auto-resume by default;
-- `/context-gc retry` reruns compaction from current persisted history;
-- `/context-gc resume` continues from the full checkpoint without another compaction;
-- `/context-gc cancel` drops scheduler state;
-- a new real input before compaction cancels pending semantic assumptions.
-
-## Current limitation and ideal core change
-
-`ctx.compact()` is an abort/manual-compact/resume shim. Codex can perform replacement-history installation inline within its sampling loop.
-
-The ideal Pi core primitive would be approximately:
-
-```text
-compactInline({ instructions })
-  -> atomically install replacement history
-  -> continue current low-level run
-```
-
-The `compact_context` tool, checkpoint schema, and scheduling policy could remain unchanged when such an API exists.
+Checkpoint bounds: completed phase/next focus up to 2,000 characters; 1–16 durable items; 1–12 verification items; up to 12 open loops and ruled-out paths; list items up to 1,000 characters. These are handoff facts, never raw logs or whole files.

@@ -1,0 +1,1621 @@
+diff --git a/packages/agent/src/agent-loop.ts b/packages/agent/src/agent-loop.ts
+index b772985ca..745a94c43 100644
+--- a/packages/agent/src/agent-loop.ts
++++ b/packages/agent/src/agent-loop.ts
+@@ -184,6 +184,19 @@ async function runLoop(
+ 			let preparedMessages: AgentMessage[] = [];
+ 			if (lastCompletedTurn) {
+ 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
++				if (nextTurnSnapshot?.end) {
++					currentContext = nextTurnSnapshot.context ?? currentContext;
++					const endingMessages = [...(nextTurnSnapshot.messages ?? []), ...pendingMessages];
++					if (endingMessages.length > 0) await emit({ type: "turn_start" });
++					for (const message of declareToolChanges(currentContext, endingMessages)) {
++						await emit({ type: "message_start", message });
++						await emit({ type: "message_end", message });
++						currentContext.messages.push(message);
++						newMessages.push(message);
++					}
++					await emit({ type: "agent_end", messages: newMessages });
++					return;
++				}
+ 				if (nextTurnSnapshot) {
+ 					currentContext = nextTurnSnapshot.context ?? currentContext;
+ 					preparedMessages = nextTurnSnapshot.messages ?? [];
+@@ -286,7 +299,7 @@ async function runLoop(
+ 			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
+ 			await emit({ type: "turn_end", message, toolResults });
+ 
+-			if (decision?.action === "end") {
++			if (signal?.aborted || decision?.action === "end") {
+ 				await emit({ type: "agent_end", messages: newMessages });
+ 				return;
+ 			}
+diff --git a/packages/agent/src/types.ts b/packages/agent/src/types.ts
+index 6e17c3c8c..0ff6f9e0a 100644
+--- a/packages/agent/src/types.ts
++++ b/packages/agent/src/types.ts
+@@ -167,6 +167,8 @@ export interface AgentLoopTurnUpdate {
+ 	model?: Model<any>;
+ 	/** Thinking level for the next provider request. */
+ 	thinkingLevel?: ThinkingLevel;
++	/** End the current run after next-turn preparation without polling queues or requesting a provider. */
++	end?: boolean;
+ }
+ 
+ /** Runtime state available immediately before a conversational provider request. */
+diff --git a/packages/coding-agent/docs/compaction.md b/packages/coding-agent/docs/compaction.md
+index a702f7b6e..f479b490a 100644
+--- a/packages/coding-agent/docs/compaction.md
++++ b/packages/coding-agent/docs/compaction.md
+@@ -289,13 +289,25 @@ This prevents the model from treating it as a conversation to continue.
+ 
+ Tool results are truncated to 2000 characters during serialization. Content beyond that limit is replaced with a marker indicating how many characters were truncated. This keeps summarization requests within reasonable token budgets, since tool results (especially from `read` and `bash`) are typically the largest contributors to context size.
+ 
++## Semantic boundary requests
++
++`ctx.requestCompaction` enters the same compaction backend with reason `semantic`, without aborting the active parent. During a run, Pi consumes the request after the full assistant/tool-result batch and before the next provider call. Idle requests use the same pipeline and can continue from the persisted checkpoint. The request supplies custom instructions and a canonical custom-message continuation; it does not supply its own summary.
++
++Pi persists replacement context and the canonical message before continuing. A subagent finishing during compaction does not own a separate parent continuation: its messages remain queued or are persisted normally if already selected by the loop. No child cancellation or wait-for-child completion is required. The scheduler must not implement an additional resume prompt in its callbacks.
++
++`force:true` uses a zero recent-token retention budget for semantic preparation only. Standard manual, threshold and overflow behavior is unchanged. An empty or already-compacted history can still be ineligible. `autoResume:false` and default failure handling end the current loop; they do not prohibit later independent input. Cancellation reports `AbortError` and never resumes automatically, even with `resumeOnFailure:true`.
++
++Ordering regressions should block the compaction backend and inject a notification both before and during the block, then verify that no provider call uses old context, no notification is lost, and the checkpoint appears once before the automatic continuation. Also test cancellation in post-compaction hooks and accepted requests on a failing turn; each request must settle even if the next-turn hook is never reached.
++
++See [Extensions](extensions.md#request-compaction-without-aborting-the-agent) for the public API.
++
+ ## Custom Summarization via Extensions
+ 
+ Extensions can intercept and customize both compaction and branch summarization. See [`extensions/types.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts) for event type definitions.
+ 
+ ### session_before_compact
+ 
+-Fired before auto-compaction or `/compact`. Can cancel or provide custom summary. See `SessionBeforeCompactEvent` and `CompactionPreparation` in the types file.
++Fired before auto-compaction, semantic compaction, or `/compact`. Can cancel or provide custom summary. See `SessionBeforeCompactEvent` and `CompactionPreparation` in the types file.
+ 
+ ```typescript
+ pi.on("session_before_compact", async (event, ctx) => {
+@@ -310,7 +322,7 @@ pi.on("session_before_compact", async (event, ctx) => {
+   // preparation.settings - effective settings after applying model overrides
+ 
+   // branchEntries - all entries on current branch (for custom state)
+-  // reason - "manual" (/compact), "threshold", or "overflow"
++  // reason - "manual" (/compact), "threshold", "overflow", or "semantic"
+   // willRetry - whether the aborted turn is retried after compaction (overflow recovery)
+   // signal - AbortSignal (pass to LLM calls)
+ 
+@@ -374,7 +386,7 @@ Fired when manual or automatic compaction fails or is aborted. This is useful fo
+ ```typescript
+ pi.on("session_compact_failed", async (event, ctx) => {
+   const { reason, errorMessage, aborted, willRetry, fromExtension } = event;
+-  // reason - "manual" (/compact), "threshold", or "overflow"
++  // reason - "manual" (/compact), "threshold", "overflow", or "semantic"
+   // errorMessage - present for non-abort failures
+   // aborted - true for canceled/aborted compactions
+   // willRetry - whether the aborted turn would have retried after compaction
+diff --git a/packages/coding-agent/docs/extensions.md b/packages/coding-agent/docs/extensions.md
+index 9ecc4d995..e8c3ec54d 100644
+--- a/packages/coding-agent/docs/extensions.md
++++ b/packages/coding-agent/docs/extensions.md
+@@ -212,6 +212,39 @@ These operations are command-only because calling them from lifecycle handlers c
+ 
+ Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
+ 
++### Request compaction without aborting the agent
++
++Use `ctx.requestCompaction(options)` for a semantic phase boundary. Unlike `ctx.compact()`, it does not abort the parent run. Pi waits until the complete current tool batch is persisted, runs the standard compaction pipeline before the next provider request, persists the supplied custom message, and continues once. Background workers remain independent and their messages are retained.
++
++```typescript
++const request = ctx.requestCompaction({
++  customInstructions: "Retain the verified decisions and outstanding work.",
++  force: true,
++  continuation: {
++    customType: "task-checkpoint",
++    content: "The investigation is complete. Next: implement the verified fix.",
++    display: false,
++  },
++  autoResume: true,
++  resumeOnFailure: false,
++  onError(error) {
++    // AbortError means cancellation, which never automatically resumes.
++    console.error(error.message);
++  },
++});
++if (!request.accepted) {
++  // Another compaction owns the boundary. Do not fall back to ctx.compact().
++}
++```
++
++Record intent from a tool or `turn_end`, not `context` (which is too late for next-turn preparation). Idle commands and shortcuts use the same pipeline. `force` sets the recent-token retention budget to zero for this semantic preparation only; it does not change configured threshold/overflow budgets or make empty history compactable.
++
++`autoResume:false` ends the current loop before another provider call. Already-selected input is persisted; other queued messages remain queued. This is not a permanent session lock: later independent input or extension triggers can start another run. Failure pauses by default; `resumeOnFailure:true` opts into one continuation with the available context. Callback observers must not send another automatic resume prompt.
++
++The returned `cancel()` cancels pending intent or in-flight semantic compaction, not the parent agent. It returns false after terminal settlement. Accepted requests receive one terminal callback; cancellation uses `AbortError` and never triggers failure auto-resume. Cancellation after persistence cannot undo the saved compaction. Session replacement invalidates pending work.
++
++See [Compaction](compaction.md#semantic-boundary-requests) for ordering and persistence details.
++
+ <a id="state-management"></a>
+ <a id="persist-state"></a>
+ 
+diff --git a/packages/coding-agent/src/core/agent-session.ts b/packages/coding-agent/src/core/agent-session.ts
+index 63aa588da..8a4cb2c5a 100644
+--- a/packages/coding-agent/src/core/agent-session.ts
++++ b/packages/coding-agent/src/core/agent-session.ts
+@@ -95,6 +95,8 @@ import {
+ 	type MessageStartEvent,
+ 	type MessageUpdateEvent,
+ 	type ReplacedSessionContext,
++	type RequestCompactionOptions,
++	type RequestCompactionResult,
+ 	type SessionBeforeCompactResult,
+ 	type SessionBeforeTreeResult,
+ 	type SessionBoundaryDraft,
+@@ -200,13 +202,13 @@ export type AgentSessionEvent =
+ 			steering: readonly string[];
+ 			followUp: readonly string[];
+ 	  }
+-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
++	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" | "semantic" }
+ 	| { type: "entry_appended"; entry: SessionEntry }
+ 	| { type: "session_info_changed"; name: string | undefined }
+ 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+ 	| {
+ 			type: "compaction_end";
+-			reason: "manual" | "threshold" | "overflow";
++			reason: "manual" | "threshold" | "overflow" | "semantic";
+ 			result: CompactionResult | undefined;
+ 			aborted: boolean;
+ 			willRetry: boolean;
+@@ -225,7 +227,7 @@ export type AgentSessionEvent =
+ 	| {
+ 			type: "summarization_retry_attempt_start";
+ 			source: "compaction";
+-			reason: "manual" | "threshold" | "overflow";
++			reason: "manual" | "threshold" | "overflow" | "semantic";
+ 	  }
+ 	| { type: "summarization_retry_finished" }
+ 	| { type: "bash_execution_update"; id?: string; delta: string };
+@@ -294,6 +296,15 @@ export interface ExtensionBindings {
+ export type QueuedInputDisposition = "handled" | "queued";
+ export type PromptDisposition = QueuedInputDisposition | "started";
+ 
++type PendingSemanticCompaction = RequestCompactionOptions & {
++	sessionId: string;
++	consumed: boolean;
++	idle: boolean;
++	settled: boolean;
++	terminalCallbackCalled: boolean;
++	abortController?: AbortController;
++};
++
+ /** Options for AgentSession.prompt() */
+ export interface PromptOptions {
+ 	/** Whether to dispatch extension commands and expand skill commands and prompt templates (default: true) */
+@@ -387,6 +398,10 @@ export class AgentSession {
+ 	private _compactionAbortController: AbortController | undefined = undefined;
+ 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+ 	private _overflowRecoveryAttempted = false;
++	private _semanticCompactionRequest: PendingSemanticCompaction | undefined;
++	private readonly _persistedSemanticContinuations = new WeakSet<object>();
++	private _semanticCompactionPaused = false;
++	private _idleSemanticCompaction = false;
+ 
+ 	// Branch summarization state
+ 	private _branchSummaryAbortController: AbortController | undefined = undefined;
+@@ -746,7 +761,22 @@ export class AgentSession {
+ 	}
+ 
+ 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
++		const request = this._semanticCompactionRequest;
++		if (request) {
++			this._semanticCompactionRequest = undefined;
++			request.consumed = true;
++			if (this.sessionManager.getSessionId() === request.sessionId) {
++				await this._runAutoCompaction("semantic", false, request.customInstructions, request);
++			} else {
++				this._semanticCompactionPaused = true;
++				await this._notifySemanticRequestError(
++					request,
++					this._semanticAbortError("Session changed before compaction"),
++				);
++			}
++		}
+ 		const projection = this.sessionManager.buildSessionProjection();
++		if (request) return { ...context, messages: projection.messages };
+ 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
+ 		const model = this.model;
+ 		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
+@@ -850,9 +880,9 @@ export class AgentSession {
+ 		this._commitBoundaryDrafts(boundary.entries);
+ 		if (boundary.continue && !this._buildBoundaryContext([], "turn_end").canContinue) {
+ 			this._reportInvalidBoundaryContinuation("turn_end");
+-			return false;
++			return this._semanticCompactionRequest !== undefined;
+ 		}
+-		return boundary.continue;
++		return boundary.continue || this._semanticCompactionRequest !== undefined;
+ 	}
+ 
+ 	private _installAgentBoundaryHooks(): void {
+@@ -890,6 +920,7 @@ export class AgentSession {
+ 
+ 			return {
+ 				...previousSnapshot,
++				end: this._semanticCompactionPaused || previousSnapshot?.end,
+ 				context: {
+ 					...nextContext,
+ 					tools: this.agent.state.tools.slice(),
+@@ -1433,7 +1464,7 @@ export class AgentSession {
+ 
+ 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
+ 	get isIdle(): boolean {
+-		return !this._isAgentRunActive && !this.isCompacting;
++		return !this._isAgentRunActive && !this.isCompacting && !this._idleSemanticCompaction;
+ 	}
+ 
+ 	/** Current effective system prompt, including changes not yet sent to the model. */
+@@ -1773,29 +1804,63 @@ export class AgentSession {
+ 	// =========================================================================
+ 
+ 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
++		await this._runAgentLoop(async () => await this.agent.prompt(messages));
++	}
++
++	private async _runAgentContinuation(): Promise<void> {
++		await this._runAgentLoop(async () => {
++			this._flushPendingBashMessages();
++			this._flushPendingCustomMessages();
++			await this.agent.continue();
++		});
++	}
++
++	/** A low-level run exited without reaching prepare-next-turn; never carry its intent into a retry. */
++	private async _settlePendingSemanticCompaction(): Promise<void> {
++		const request = this._semanticCompactionRequest;
++		if (!request) return;
++		this._semanticCompactionRequest = undefined;
++		const message = this._lastAssistantMessage;
++		const error =
++			this._agentRunAbortRequested || message?.stopReason === "aborted"
++				? this._semanticAbortError("Agent run aborted before semantic compaction")
++				: new Error(message?.errorMessage || "Agent run ended before semantic compaction");
++		await this._notifySemanticRequestError(request, error);
++	}
++
++	private async _runAgentLoop(start: () => Promise<unknown>): Promise<void> {
+ 		this._agentRunAbortRequested = false;
+-		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
+ 		this._failedResponse = undefined;
+ 		this._recordSelection();
+-		// The run records the loadout in the transcript; restored tools that did not register by now
+-		// are dropped, so a tool that never registers does not stay pending.
+ 		this._pendingToolNames.clear();
+ 		this._isAgentRunActive = true;
+ 		try {
+-			await this.agent.prompt(messages);
++			await start();
++			await this._settlePendingSemanticCompaction();
+ 			while (!this._agentRunAbortRequested) {
++				if (this._semanticCompactionPaused) {
++					this._lastAssistantMessage = undefined;
++					this._lastAssistantToolResults = [];
++					break;
++				}
+ 				if (await this._handlePostAgentRun()) {
+ 					if (this._agentRunAbortRequested) break;
+ 					await this.agent.continue();
++					await this._settlePendingSemanticCompaction();
++					if (this._semanticCompactionPaused) break;
+ 					continue;
+ 				}
+ 				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
+ 				if (this._agentRunAbortRequested) break;
+ 				await this.agent.continue();
++				await this._settlePendingSemanticCompaction();
++				if (this._semanticCompactionPaused) break;
+ 			}
+ 		} finally {
++			await this._settlePendingSemanticCompaction();
+ 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+ 			this._failedResponse = undefined;
++			this._semanticCompactionPaused = false;
+ 			this._runSystemPromptOptions = undefined;
+ 			this._flushPendingBashMessages();
+ 			this._flushPendingCustomMessages();
+@@ -1936,7 +2001,7 @@ export class AgentSession {
+ 			}
+ 		}
+ 
+-		if (this._compactionAbortController !== undefined) {
++		if (this._compactionAbortController !== undefined || this._idleSemanticCompaction) {
+ 			throw new Error(
+ 				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
+ 			);
+@@ -2256,6 +2321,10 @@ export class AgentSession {
+ 			details: message.details,
+ 			timestamp: Date.now(),
+ 		} satisfies CustomMessage<T>;
++		if (this._idleSemanticCompaction) {
++			this._pendingCustomMessages.push(appMessage);
++			return;
++		}
+ 		if (options?.deliverAs === "nextTurn") {
+ 			this._pendingNextTurnMessages.push(appMessage);
+ 		} else if (this.isStreaming && options?.triggerTurn !== false) {
+@@ -2385,6 +2454,12 @@ export class AgentSession {
+ 	 * Abort current operation and wait for agent to become idle.
+ 	 */
+ 	async abort(): Promise<void> {
++		const semanticRequest = this._semanticCompactionRequest;
++		this._semanticCompactionRequest = undefined;
++		if (semanticRequest) {
++			semanticRequest.settled = true;
++			await this._notifySemanticRequestError(semanticRequest, this._semanticAbortError("Agent run aborted"));
++		}
+ 		if (this._isAgentRunActive) {
+ 			this._agentRunAbortRequested = true;
+ 		}
+@@ -2674,7 +2749,7 @@ export class AgentSession {
+ 		model: Model<any>,
+ 		customInstructions: string | undefined,
+ 		signal: AbortSignal,
+-		reason: "manual" | "threshold" | "overflow",
++		reason: "manual" | "threshold" | "overflow" | "semantic",
+ 	): Promise<CompactionResult> {
+ 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
+ 		const request = await this._getSummarizationRequestAuth(model, signal);
+@@ -2694,6 +2769,111 @@ export class AgentSession {
+ 		);
+ 	}
+ 
++	private async _notifySemanticRequestError(request: PendingSemanticCompaction, error: Error): Promise<void> {
++		if (request.terminalCallbackCalled) return;
++		request.settled = true;
++		request.terminalCallbackCalled = true;
++		try {
++			await request.onError?.(error);
++		} catch {
++			/* Observers cannot change runtime ownership. */
++		}
++	}
++
++	private _semanticAbortError(message: string): Error {
++		const error = new Error(message);
++		error.name = "AbortError";
++		return error;
++	}
++
++	private async _runIdleSemanticCompaction(request: PendingSemanticCompaction): Promise<void> {
++		this._idleSemanticCompaction = true;
++		this._agentRunAbortRequested = false;
++		request.consumed = true;
++		try {
++			if (this.sessionManager.getSessionId() !== request.sessionId) {
++				await this._notifySemanticRequestError(
++					request,
++					this._semanticAbortError("Session changed before compaction"),
++				);
++				return;
++			}
++			const shouldContinue = await this._runAutoCompaction("semantic", false, request.customInstructions, request);
++			if (
++				shouldContinue &&
++				!this._agentRunAbortRequested &&
++				!this._isAgentRunActive &&
++				this.sessionManager.getSessionId() === request.sessionId
++			) {
++				this._idleSemanticCompaction = false;
++				await this._runAgentContinuation();
++			}
++		} catch (error) {
++			await this._notifySemanticRequestError(request, error instanceof Error ? error : new Error(String(error)));
++		} finally {
++			request.settled = true;
++			request.abortController = undefined;
++			this._idleSemanticCompaction = false;
++			this._resolveIdleWaitIfIdle();
++		}
++	}
++
++	requestCompaction(options: RequestCompactionOptions): RequestCompactionResult {
++		if (this._semanticCompactionRequest || this._idleSemanticCompaction || this.isCompacting) {
++			return { accepted: false, cancel: () => false };
++		}
++		let sessionId: string;
++		try {
++			sessionId = this.sessionManager.getSessionId();
++		} catch {
++			return { accepted: false, cancel: () => false };
++		}
++		const idle = !this._isAgentRunActive;
++		const request: PendingSemanticCompaction = {
++			...options,
++			sessionId,
++			idle,
++			consumed: idle,
++			settled: false,
++			terminalCallbackCalled: false,
++		};
++		if (idle) {
++			void this._runIdleSemanticCompaction(request);
++		} else {
++			this._semanticCompactionRequest = request;
++		}
++		return {
++			accepted: true,
++			cancel: () => {
++				if (request.settled) return false;
++				if (this._semanticCompactionRequest === request) {
++					this._semanticCompactionRequest = undefined;
++					request.settled = true;
++					void this._notifySemanticRequestError(
++						request,
++						this._semanticAbortError("Semantic compaction cancelled"),
++					);
++					return true;
++				}
++				if (!request.consumed || !request.abortController) return false;
++				request.abortController.abort();
++				return true;
++			},
++		};
++	}
++
++	private _appendSemanticContinuation(request: PendingSemanticCompaction): void {
++		if (this._persistedSemanticContinuations.has(request)) return;
++		this._persistedSemanticContinuations.add(request);
++		this.sessionManager.appendCustomMessageEntry(
++			request.continuation.customType,
++			request.continuation.content,
++			request.continuation.display ?? false,
++			request.continuation.details,
++		);
++		this._refreshFinalizedContext();
++	}
++
+ 	private _clearManualCompactionState(): void {
+ 		this._compactionAbortController = undefined;
+ 		this._resolveIdleWaitIfIdle();
+@@ -3047,7 +3227,12 @@ export class AgentSession {
+ 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
+ 	 * @returns Whether the post-run loop should call `agent.continue()`
+ 	 */
+-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
++	private async _runAutoCompaction(
++		reason: "overflow" | "threshold" | "semantic",
++		willRetry: boolean,
++		customInstructions?: string,
++		semanticRequest?: PendingSemanticCompaction,
++	): Promise<boolean> {
+ 		const model = this.model;
+ 		const settings = this.settingsManager.getCompactionSettings(model);
+ 		let abortController: AbortController | undefined;
+@@ -3057,17 +3242,40 @@ export class AgentSession {
+ 
+ 		try {
+ 			if (!model) {
+-				return false;
++				if (semanticRequest) {
++					this._appendSemanticContinuation(semanticRequest);
++					this._semanticCompactionPaused = !semanticRequest.resumeOnFailure && !semanticRequest.idle;
++					await this._notifySemanticRequestError(semanticRequest, new Error("No model selected"));
++				}
++				return semanticRequest?.resumeOnFailure === true;
+ 			}
+ 
+ 			const pathEntries = this.sessionManager.getBranch();
+-			const preparation = prepareCompaction(pathEntries, settings);
++			const preparation = prepareCompaction(
++				pathEntries,
++				semanticRequest?.force ? { ...settings, keepRecentTokens: 0 } : settings,
++			);
+ 			if (!preparation) {
+-				return false;
++				if (semanticRequest) {
++					this._appendSemanticContinuation(semanticRequest);
++					await this._notifySemanticRequestError(
++						semanticRequest,
++						new Error("Nothing to compact (session too small or already compacted)"),
++					);
++					this._semanticCompactionPaused = !semanticRequest.resumeOnFailure && !semanticRequest.idle;
++				}
++				return semanticRequest?.resumeOnFailure === true;
+ 			}
+ 
++			const assertCurrentSession = () => {
++				if (semanticRequest && this.sessionManager.getSessionId() !== semanticRequest.sessionId) {
++					cancelledByExtension = true;
++					throw new Error("Session changed during compaction");
++				}
++			};
+ 			abortController = new AbortController();
+ 			this._autoCompactionAbortController = abortController;
++			if (semanticRequest) semanticRequest.abortController = abortController;
+ 			started = true;
+ 			this._emit({ type: "compaction_start", reason });
+ 			abortController.signal.throwIfAborted();
+@@ -3079,7 +3287,7 @@ export class AgentSession {
+ 					type: "session_before_compact",
+ 					preparation,
+ 					branchEntries: pathEntries,
+-					customInstructions: undefined,
++					customInstructions,
+ 					reason,
+ 					willRetry,
+ 					signal: abortController.signal,
+@@ -3096,6 +3304,7 @@ export class AgentSession {
+ 				}
+ 			}
+ 			abortController.signal.throwIfAborted();
++			assertCurrentSession();
+ 
+ 			let summary: string;
+ 			let firstKeptEntryId: string;
+@@ -3115,7 +3324,7 @@ export class AgentSession {
+ 				const compactResult = await this._runDefaultCompaction(
+ 					preparation,
+ 					model,
+-					undefined,
++					customInstructions,
+ 					abortController.signal,
+ 					reason,
+ 				);
+@@ -3126,8 +3335,10 @@ export class AgentSession {
+ 				details = compactResult.details;
+ 			}
+ 			abortController.signal.throwIfAborted();
++			assertCurrentSession();
+ 
+ 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
++			if (semanticRequest) this._appendSemanticContinuation(semanticRequest);
+ 			const newEntries = this.sessionManager.getEntries();
+ 			this._refreshFinalizedContext();
+ 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
+@@ -3147,6 +3358,12 @@ export class AgentSession {
+ 				});
+ 			}
+ 
++			// The summary and checkpoint are durable, but the awaited hook can still cancel continuation.
++			if (semanticRequest) {
++				abortController.signal.throwIfAborted();
++				assertCurrentSession();
++			}
++
+ 			const result: CompactionResult = {
+ 				summary,
+ 				firstKeptEntryId,
+@@ -3155,9 +3372,25 @@ export class AgentSession {
+ 				usage,
+ 				details,
+ 			};
++			if (semanticRequest) {
++				this._semanticCompactionPaused = semanticRequest.autoResume === false && !semanticRequest.idle;
++				semanticRequest.settled = true;
++				semanticRequest.terminalCallbackCalled = true;
++				try {
++					await semanticRequest.onComplete?.(result);
++				} catch {
++					/* observational */
++				}
++			}
+ 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+ 
+ 			if (willRetry) return true;
++			if (semanticRequest) {
++				const canContinue =
++					!abortController.signal.aborted && this.sessionManager.getSessionId() === semanticRequest.sessionId;
++				if (!canContinue) this._semanticCompactionPaused = !semanticRequest.idle;
++				return canContinue && semanticRequest.autoResume !== false;
++			}
+ 
+ 			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
+ 			// Continue once so queued messages are delivered.
+@@ -3165,6 +3398,19 @@ export class AgentSession {
+ 		} catch (error) {
+ 			const message = error instanceof Error ? error.message : "compaction failed";
+ 			const aborted = abortController?.signal.aborted === true || cancelledByExtension;
++			if (semanticRequest) {
++				if (aborted) {
++					this._semanticCompactionPaused = !semanticRequest.idle;
++					await this._notifySemanticRequestError(semanticRequest, this._semanticAbortError(message));
++				} else {
++					this._semanticCompactionPaused = !semanticRequest.resumeOnFailure && !semanticRequest.idle;
++					this._appendSemanticContinuation(semanticRequest);
++					await this._notifySemanticRequestError(
++						semanticRequest,
++						error instanceof Error ? error : new Error(message),
++					);
++				}
++			}
+ 			if (started) {
+ 				const errorMessage = aborted
+ 					? undefined
+@@ -3187,8 +3433,17 @@ export class AgentSession {
+ 					fromExtension,
+ 				});
+ 			}
+-			return false;
++			const canResume =
++				!aborted &&
++				!abortController?.signal.aborted &&
++				(!semanticRequest || this.sessionManager.getSessionId() === semanticRequest.sessionId);
++			if (semanticRequest && !canResume) this._semanticCompactionPaused = !semanticRequest.idle;
++			return semanticRequest?.resumeOnFailure === true && canResume;
+ 		} finally {
++			if (semanticRequest) {
++				semanticRequest.settled = true;
++				semanticRequest.abortController = undefined;
++			}
+ 			if (this._autoCompactionAbortController === abortController) {
+ 				this._autoCompactionAbortController = undefined;
+ 			}
+@@ -3404,6 +3659,7 @@ export class AgentSession {
+ 					this._extensionShutdownHandler?.();
+ 				},
+ 				getContextUsage: () => this.getContextUsage(),
++				requestCompaction: (options) => this.requestCompaction(options),
+ 				compact: (options) => {
+ 					void (async () => {
+ 						try {
+@@ -3670,7 +3926,9 @@ export class AgentSession {
+ 	 * the TUI needs to render the retry and recreate the underlying indicator.
+ 	 */
+ 	private _summarizationRetryCallbacks(
+-		source: { source: "branchSummary" } | { source: "compaction"; reason: "manual" | "threshold" | "overflow" },
++		source:
++			| { source: "branchSummary" }
++			| { source: "compaction"; reason: "manual" | "threshold" | "overflow" | "semantic" },
+ 	): RetryCallbacks {
+ 		return {
+ 			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {
+diff --git a/packages/coding-agent/src/core/extensions/index.ts b/packages/coding-agent/src/core/extensions/index.ts
+index 4172d0186..8b9924f6a 100644
+--- a/packages/coding-agent/src/core/extensions/index.ts
++++ b/packages/coding-agent/src/core/extensions/index.ts
+@@ -141,6 +141,8 @@ export type {
+ 	RegisteredCommand,
+ 	RegisteredTool,
+ 	ReplacedSessionContext,
++	RequestCompactionOptions,
++	RequestCompactionResult,
+ 	ResolvedCommand,
+ 	// Events - Resources
+ 	ResourcesDiscoverEvent,
+diff --git a/packages/coding-agent/src/core/extensions/runner.ts b/packages/coding-agent/src/core/extensions/runner.ts
+index 59e1eb62e..7d0711769 100644
+--- a/packages/coding-agent/src/core/extensions/runner.ts
++++ b/packages/coding-agent/src/core/extensions/runner.ts
+@@ -71,6 +71,8 @@ import type {
+ 	RegisteredCommand,
+ 	RegisteredTool,
+ 	ReplacedSessionContext,
++	RequestCompactionOptions,
++	RequestCompactionResult,
+ 	ResolvedCommand,
+ 	ResourcesDiscoverEvent,
+ 	ResourcesDiscoverResult,
+@@ -372,6 +374,10 @@ export class ExtensionRunner {
+ 	private hasPendingMessagesFn: () => boolean = () => false;
+ 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
+ 	private compactFn: (options?: CompactOptions) => void = () => {};
++	private requestCompactionFn: (options: RequestCompactionOptions) => RequestCompactionResult = () => ({
++		accepted: false,
++		cancel: () => false,
++	});
+ 	private getSystemPromptFn: () => string = () => "";
+ 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
+ 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
+@@ -446,6 +452,7 @@ export class ExtensionRunner {
+ 		this.shutdownHandler = contextActions.shutdown;
+ 		this.getContextUsageFn = contextActions.getContextUsage;
+ 		this.compactFn = contextActions.compact;
++		this.requestCompactionFn = contextActions.requestCompaction;
+ 		this.getSystemPromptFn = contextActions.getSystemPrompt;
+ 		this.getSystemPromptOptionsFn =
+ 			contextActions.getSystemPromptOptions ?? (() => normalizeBuildSystemPromptOptions({ cwd: this.cwd }));
+@@ -938,6 +945,10 @@ export class ExtensionRunner {
+ 				runner.assertActive();
+ 				runner.compactFn(options);
+ 			},
++			requestCompaction: (options) => {
++				runner.assertActive();
++				return runner.requestCompactionFn(options);
++			},
+ 			getSystemPrompt: () => {
+ 				runner.assertActive();
+ 				return runner.getSystemPromptFn();
+diff --git a/packages/coding-agent/src/core/extensions/types.ts b/packages/coding-agent/src/core/extensions/types.ts
+index 3e0ea47ba..5166ac8eb 100644
+--- a/packages/coding-agent/src/core/extensions/types.ts
++++ b/packages/coding-agent/src/core/extensions/types.ts
+@@ -317,6 +317,21 @@ export interface CompactOptions {
+ 	onError?: (error: Error) => void;
+ }
+ 
++export interface RequestCompactionOptions {
++	customInstructions?: string;
++	force?: boolean;
++	continuation: { customType: string; content: string; display?: boolean; details?: unknown };
++	autoResume?: boolean;
++	resumeOnFailure?: boolean;
++	onComplete?: (result: CompactionResult) => void | Promise<void>;
++	onError?: (error: Error) => void | Promise<void>;
++}
++
++export interface RequestCompactionResult {
++	accepted: boolean;
++	cancel(): boolean;
++}
++
+ /**
+  * Context passed to extension event handlers.
+  */
+@@ -360,6 +375,8 @@ export interface ExtensionContext {
+ 	getContextUsage(): ContextUsage | undefined;
+ 	/** Trigger compaction without awaiting completion. */
+ 	compact(options?: CompactOptions): void;
++	/** Request non-aborting compaction at the next post-turn/pre-provider boundary. */
++	requestCompaction(options: RequestCompactionOptions): RequestCompactionResult;
+ 	/** Get the current effective system prompt. */
+ 	getSystemPrompt(): string;
+ }
+@@ -754,7 +771,7 @@ export interface SessionBeforeCompactEvent {
+ 	branchEntries: SessionEntry[];
+ 	customInstructions?: string;
+ 	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
+-	reason: "manual" | "threshold" | "overflow";
++	reason: "manual" | "threshold" | "overflow" | "semantic";
+ 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
+ 	willRetry: boolean;
+ 	signal: AbortSignal;
+@@ -766,7 +783,7 @@ export interface SessionCompactEvent {
+ 	compactionEntry: CompactionEntry;
+ 	fromExtension: boolean;
+ 	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
+-	reason: "manual" | "threshold" | "overflow";
++	reason: "manual" | "threshold" | "overflow" | "semantic";
+ 	/** True when the aborted turn is retried after this compaction (overflow recovery) */
+ 	willRetry: boolean;
+ }
+@@ -775,7 +792,7 @@ export interface SessionCompactEvent {
+ export interface SessionCompactFailedEvent {
+ 	type: "session_compact_failed";
+ 	/** What triggered the compaction: manual /compact, the context threshold, or context overflow recovery */
+-	reason: "manual" | "threshold" | "overflow";
++	reason: "manual" | "threshold" | "overflow" | "semantic";
+ 	/** Error text when compaction failed for a non-abort reason. */
+ 	errorMessage?: string;
+ 	/** True when compaction was cancelled or aborted. */
+@@ -2161,6 +2178,7 @@ export interface ExtensionContextActions {
+ 	shutdown: () => void;
+ 	getContextUsage: () => ContextUsage | undefined;
+ 	compact: (options?: CompactOptions) => void;
++	requestCompaction: (options: RequestCompactionOptions) => RequestCompactionResult;
+ 	getSystemPrompt: () => string;
+ 	getSystemPromptOptions?: () => BuildSystemPromptOptions;
+ 	/** Backs `ExtensionToolContext.executeTool()`. Without it, nested calls fail. */
+diff --git a/packages/coding-agent/src/index.ts b/packages/coding-agent/src/index.ts
+index 9e2d993e7..23ec28ffc 100644
+--- a/packages/coding-agent/src/index.ts
++++ b/packages/coding-agent/src/index.ts
+@@ -143,6 +143,8 @@ export type {
+ 	ReadToolCallEvent,
+ 	RegisteredCommand,
+ 	RegisteredTool,
++	RequestCompactionOptions,
++	RequestCompactionResult,
+ 	ResolvedCommand,
+ 	ResourcesDiscoverEvent,
+ 	ResourcesDiscoverResult,
+diff --git a/packages/coding-agent/src/modes/interactive/components/status-indicator.ts b/packages/coding-agent/src/modes/interactive/components/status-indicator.ts
+index be2732103..6cc21d697 100644
+--- a/packages/coding-agent/src/modes/interactive/components/status-indicator.ts
++++ b/packages/coding-agent/src/modes/interactive/components/status-indicator.ts
+@@ -80,7 +80,7 @@ export class RetryStatusIndicator extends StatusIndicator {
+ 	}
+ }
+ 
+-export type CompactionStatusReason = "manual" | "threshold" | "overflow";
++export type CompactionStatusReason = "manual" | "threshold" | "overflow" | "semantic";
+ 
+ export class CompactionStatusIndicator extends StatusIndicator {
+ 	constructor(ui: TUI, reason: CompactionStatusReason) {
+diff --git a/packages/coding-agent/src/modes/interactive/interactive-mode.ts b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+index 158f59e5f..b5d9bf6b6 100644
+--- a/packages/coding-agent/src/modes/interactive/interactive-mode.ts
++++ b/packages/coding-agent/src/modes/interactive/interactive-mode.ts
+@@ -2216,6 +2216,7 @@ export class InteractiveMode {
+ 				this.shutdownRequested = true;
+ 			},
+ 			getContextUsage: () => this.session.getContextUsage(),
++			requestCompaction: (options) => this.session.requestCompaction(options),
+ 			compact: (options) => {
+ 				void (async () => {
+ 					try {
+diff --git a/packages/coding-agent/test/extensions-runner.test.ts b/packages/coding-agent/test/extensions-runner.test.ts
+index 55a8066c2..0c64ea2ff 100644
+--- a/packages/coding-agent/test/extensions-runner.test.ts
++++ b/packages/coding-agent/test/extensions-runner.test.ts
+@@ -107,6 +107,7 @@ describe("ExtensionRunner", () => {
+ 		shutdown: () => {},
+ 		getContextUsage: () => undefined,
+ 		compact: () => {},
++		requestCompaction: () => ({ accepted: false, cancel: () => false }),
+ 		getSystemPrompt: () => "",
+ 		getScopedModels: () => [],
+ 	};
+diff --git a/packages/coding-agent/test/suite/agent-session-boundaries.test.ts b/packages/coding-agent/test/suite/agent-session-boundaries.test.ts
+index 5115efb74..7aea49383 100644
+--- a/packages/coding-agent/test/suite/agent-session-boundaries.test.ts
++++ b/packages/coding-agent/test/suite/agent-session-boundaries.test.ts
+@@ -19,6 +19,732 @@ describe("AgentSession actionable boundaries", () => {
+ 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+ 	});
+ 
++	it("runs requested compaction at the completed turn boundary and pauses before queued notifications", async () => {
++		const tool: AgentTool = {
++			name: "semantic_checkpoint_tool",
++			label: "Semantic checkpoint",
++			description: "Checkpoint",
++			parameters: Type.Object({}),
++			execute: async () => ({ content: [{ type: "text", text: "tool result persisted" }], details: {} }),
++		};
++		const compactionStarted = deferred();
++		const releaseCompaction = deferred();
++		let requestAccepted = false;
++		let completionCalls = 0;
++		let queuedWhileCompacting: Promise<void> | undefined;
++		const harness = await createHarness({
++			tools: [tool],
++			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
++			extensionFactories: [
++				(pi) => {
++					pi.on("turn_end", (_event, ctx) => {
++						const request = ctx.requestCompaction({
++							continuation: {
++								customType: "semantic-checkpoint",
++								content: "resume canonical checkpoint",
++								display: false,
++							},
++							autoResume: false,
++							onComplete: () => {
++								completionCalls++;
++							},
++						});
++						requestAccepted = request.accepted;
++					});
++					pi.on("session_before_compact", async (event) => {
++						expect(
++							event.branchEntries.some(
++								(entry) => entry.type === "message" && entry.message.role === "toolResult",
++							),
++						).toBe(true);
++						compactionStarted.resolve();
++						await releaseCompaction.promise;
++						return {
++							compaction: {
++								summary: "semantic summary",
++								firstKeptEntryId: event.preparation.firstKeptEntryId,
++								tokensBefore: event.preparation.tokensBefore,
++							},
++						};
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.sessionManager.appendMessage({ role: "user", content: "old context", timestamp: Date.now() - 2 });
++		harness.sessionManager.appendMessage(fauxAssistantMessage("old response", { timestamp: Date.now() - 1 }));
++		harness.session.refreshContext();
++		harness.session.subscribe((event) => {
++			if (event.type === "compaction_start" && !queuedWhileCompacting) {
++				queuedWhileCompacting = harness.session.sendUserMessage("notification while compacting", {
++					deliverAs: "steer",
++				});
++			}
++		});
++		harness.setResponses([
++			fauxAssistantMessage(fauxToolCall("semantic_checkpoint_tool", {}), { stopReason: "toolUse" }),
++		]);
++
++		const prompt = harness.session.prompt("completed request");
++		await compactionStarted.promise;
++		await queuedWhileCompacting;
++		releaseCompaction.resolve();
++		await prompt;
++
++		expect(requestAccepted).toBe(true);
++		expect(completionCalls).toBe(1);
++		expect(harness.faux.state.callCount).toBe(1);
++		expect(harness.session.getSteeringMessages()).toContain("notification while compacting");
++		expect(harness.sessionManager.getEntries()).toContainEqual(
++			expect.objectContaining({
++				type: "custom_message",
++				customType: "semantic-checkpoint",
++				content: "resume canonical checkpoint",
++				display: false,
++			}),
++		);
++		expect(
++			harness.sessionManager
++				.getBranch()
++				.some((entry) => entry.type === "compaction" && entry.summary === "semantic summary"),
++		).toBe(true);
++	});
++
++	it("aborting a run with an accepted pending request reports AbortError once and never resumes", async () => {
++		const toolStarted = deferred();
++		const releaseTool = deferred();
++		let callbackError: Error | undefined;
++		const tool: AgentTool = {
++			name: "blocking_semantic_request",
++			label: "Blocking request",
++			description: "Wait for cancellation",
++			parameters: Type.Object({}),
++			execute: async () => {
++				await releaseTool.promise;
++				return { content: [{ type: "text", text: "done" }], details: {} };
++			},
++		};
++		const harness = await createHarness({
++			tools: [tool],
++			extensionFactories: [
++				(pi) => {
++					pi.on("tool_execution_start", (_event, ctx) => {
++						ctx.requestCompaction({
++							continuation: { customType: "semantic-checkpoint", content: "must not resume", display: false },
++							resumeOnFailure: true,
++							onError: (error) => {
++								callbackError = error;
++							},
++						});
++						toolStarted.resolve();
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.setResponses([
++			fauxAssistantMessage(fauxToolCall("blocking_semantic_request", {}), { stopReason: "toolUse" }),
++		]);
++
++		const prompt = harness.session.prompt("start");
++		await toolStarted.promise;
++		const abort = harness.session.abort();
++		releaseTool.resolve();
++		await abort;
++		await prompt;
++
++		expect(callbackError?.name).toBe("AbortError");
++		expect(harness.faux.state.callCount).toBe(1);
++		expect(harness.eventsOfType("compaction_start")).toEqual([]);
++		expect(harness.sessionManager.getEntries()).not.toContainEqual(
++			expect.objectContaining({ type: "custom_message", customType: "semantic-checkpoint" }),
++		);
++	});
++
++	it("continues exactly once from the persisted semantic compaction and checkpoint", async () => {
++		let completionCalls = 0;
++		let requested = false;
++		let nextContext = "";
++		const harness = await createHarness({
++			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
++			extensionFactories: [
++				(pi) => {
++					pi.on("turn_end", (_event, ctx) => {
++						if (requested) return;
++						requested = true;
++						ctx.requestCompaction({
++							continuation: {
++								customType: "semantic-checkpoint",
++								content: "canonical continuation",
++								display: false,
++							},
++							onComplete: () => {
++								completionCalls++;
++							},
++						});
++					});
++					pi.on("session_before_compact", (event) => ({
++						compaction: {
++							summary: "semantic continuation summary",
++							firstKeptEntryId: event.preparation.firstKeptEntryId,
++							tokensBefore: event.preparation.tokensBefore,
++						},
++					}));
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.sessionManager.appendMessage({ role: "user", content: "older history", timestamp: Date.now() - 2 });
++		harness.sessionManager.appendMessage(fauxAssistantMessage("older answer", { timestamp: Date.now() - 1 }));
++		harness.session.refreshContext();
++		harness.setResponses([
++			fauxAssistantMessage("completed turn"),
++			(context) => {
++				nextContext = JSON.stringify(context.messages);
++				return fauxAssistantMessage("continued once");
++			},
++		]);
++
++		await harness.session.prompt("semantic request");
++
++		expect(completionCalls).toBe(1);
++		expect(harness.faux.state.callCount).toBe(2);
++		expect(nextContext).toContain("semantic continuation summary");
++		expect(nextContext).toContain("canonical continuation");
++		expect(
++			harness.session.messages.filter((message) => message.role === "assistant" && message.stopReason === "aborted"),
++		).toHaveLength(0);
++	});
++
++	it("persists a steering notification dequeued before the paused boundary", async () => {
++		let requested = false;
++		const harness = await createHarness({
++			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
++			extensionFactories: [
++				(pi) => {
++					pi.on("turn_end", async (_event, ctx) => {
++						if (requested) return;
++						requested = true;
++						await pi.sendUserMessage("queued before boundary", { deliverAs: "steer" });
++						ctx.requestCompaction({
++							continuation: { customType: "semantic-checkpoint", content: "pause ledger", display: false },
++							autoResume: false,
++						});
++					});
++					pi.on("session_before_compact", (event) => ({
++						compaction: {
++							summary: "pause summary",
++							firstKeptEntryId: event.preparation.firstKeptEntryId,
++							tokensBefore: event.preparation.tokensBefore,
++						},
++					}));
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.sessionManager.appendMessage({ role: "user", content: "old context", timestamp: Date.now() - 2 });
++		harness.sessionManager.appendMessage(fauxAssistantMessage("old answer", { timestamp: Date.now() - 1 }));
++		harness.session.refreshContext();
++		harness.setResponses([fauxAssistantMessage("completed")]);
++
++		await harness.session.prompt("request");
++
++		expect(harness.faux.state.callCount).toBe(1);
++		expect(
++			harness.session.messages.some(
++				(message) => message.role === "user" && getMessageText(message) === "queued before boundary",
++			),
++		).toBe(true);
++		expect(
++			harness.session.messages.some((message) => message.role === "assistant" && message.stopReason === "aborted"),
++		).toBe(false);
++	});
++
++	it("automatically continues once after a blocked semantic compaction and delivers a notification", async () => {
++		const compactionStarted = deferred();
++		const releaseCompaction = deferred();
++		let requested = false;
++		let notificationQueued: Promise<void> | undefined;
++		let nextContext = "";
++		const harness = await createHarness({
++			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
++			extensionFactories: [
++				(pi) => {
++					pi.on("turn_end", (_event, ctx) => {
++						if (requested) return;
++						requested = true;
++						ctx.requestCompaction({
++							continuation: {
++								customType: "semantic-checkpoint",
++								content: "exactly one canonical continuation",
++								display: false,
++							},
++						});
++					});
++					pi.on("session_before_compact", async (event) => {
++						compactionStarted.resolve();
++						await releaseCompaction.promise;
++						return {
++							compaction: {
++								summary: "blocked semantic summary",
++								firstKeptEntryId: event.preparation.firstKeptEntryId,
++								tokensBefore: event.preparation.tokensBefore,
++							},
++						};
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.sessionManager.appendMessage({ role: "user", content: "old context", timestamp: Date.now() - 2 });
++		harness.sessionManager.appendMessage(fauxAssistantMessage("old answer", { timestamp: Date.now() - 1 }));
++		harness.session.refreshContext();
++		harness.session.subscribe((event) => {
++			if (event.type === "compaction_start" && !notificationQueued) {
++				notificationQueued = harness.session.sendCustomMessage(
++					{ customType: "agent-notification", content: "notify after compaction", display: false },
++					{ triggerTurn: true },
++				);
++			}
++		});
++		harness.setResponses([
++			fauxAssistantMessage("completed"),
++			(context) => {
++				nextContext = JSON.stringify(context.messages);
++				return fauxAssistantMessage("continued once");
++			},
++		]);
++
++		const prompt = harness.session.prompt("request");
++		await compactionStarted.promise;
++		await notificationQueued;
++		expect(harness.eventsOfType("agent_settled")).toHaveLength(0);
++		expect(harness.faux.state.callCount).toBe(1);
++		releaseCompaction.resolve();
++		await prompt;
++
++		expect(harness.faux.state.callCount).toBe(2);
++		expect(nextContext).toContain("blocked semantic summary");
++		expect(nextContext).toContain("exactly one canonical continuation");
++		expect(nextContext.match(/notify after compaction/g)).toHaveLength(1);
++		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
++		expect(
++			harness.events.some(
++				(event) =>
++					event.type === "agent_end" &&
++					event.messages.some((message) => message.role === "assistant" && message.stopReason === "aborted"),
++			),
++		).toBe(false);
++		expect(
++			harness.eventsOfType("compaction_end").every((event) => event.result !== undefined && !event.aborted),
++		).toBe(true);
++	});
++
++	it("supports idle retry with forced preparation and dispatches the persisted continuation once", async () => {
++		let hookCalls = 0;
++		let completionCalls = 0;
++		let context = "";
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.on("session_before_compact", (event) => {
++						hookCalls++;
++						return {
++							compaction: {
++								summary: "forced idle summary",
++								firstKeptEntryId: event.preparation.firstKeptEntryId,
++								tokensBefore: event.preparation.tokensBefore,
++							},
++						};
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.sessionManager.appendMessage({ role: "user", content: "short old context", timestamp: Date.now() - 2 });
++		harness.sessionManager.appendMessage(fauxAssistantMessage("short old answer", { timestamp: Date.now() - 1 }));
++		harness.session.refreshContext();
++		harness.setResponses([
++			(request) => {
++				context = JSON.stringify(request.messages);
++				return fauxAssistantMessage("retried continuation");
++			},
++		]);
++
++		const request = harness.session.requestCompaction({
++			force: true,
++			continuation: { customType: "semantic-checkpoint", content: "retry ledger", display: false },
++			onComplete: () => {
++				completionCalls++;
++			},
++		});
++		expect(request.accepted).toBe(true);
++		await harness.session.waitForIdle();
++
++		expect(hookCalls).toBe(1);
++		expect(completionCalls).toBe(1);
++		expect(harness.faux.state.callCount).toBe(1);
++		expect(context).toContain("forced idle summary");
++		expect(context).toContain("retry ledger");
++	});
++
++	it("resumes an idle failed compaction only when resumeOnFailure is configured", async () => {
++		let errors = 0;
++		let context = "";
++		const harness = await createHarness({});
++		harnesses.push(harness);
++		harness.sessionManager.appendMessage({
++			role: "user",
++			content: "too little history to compact",
++			timestamp: Date.now() - 1,
++		});
++		harness.session.refreshContext();
++		harness.setResponses([
++			(request) => {
++				context = JSON.stringify(request.messages);
++				return fauxAssistantMessage("resumed after failure");
++			},
++		]);
++
++		const request = harness.session.requestCompaction({
++			continuation: { customType: "semantic-checkpoint", content: "failure ledger", display: false },
++			autoResume: false,
++			resumeOnFailure: true,
++			onError: () => {
++				errors++;
++			},
++		});
++		expect(request.accepted).toBe(true);
++		await harness.session.waitForIdle();
++
++		expect(errors).toBe(1);
++		expect(harness.faux.state.callCount).toBe(1);
++		expect(context).toContain("failure ledger");
++	});
++
++	it("cancels an in-flight idle retry with one AbortError callback and no continuation", async () => {
++		const hookStarted = deferred();
++		const releaseHook = deferred();
++		let callbackError: Error | undefined;
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.on("session_before_compact", async () => {
++						hookStarted.resolve();
++						await releaseHook.promise;
++						return { cancel: false };
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.sessionManager.appendMessage({ role: "user", content: "older request", timestamp: Date.now() - 4 });
++		harness.sessionManager.appendMessage(fauxAssistantMessage("older response", { timestamp: Date.now() - 3 }));
++		harness.sessionManager.appendMessage({ role: "user", content: "old context", timestamp: Date.now() - 2 });
++		harness.sessionManager.appendMessage(fauxAssistantMessage("old answer", { timestamp: Date.now() - 1 }));
++		harness.session.refreshContext();
++		harness.setResponses([]);
++
++		const request = harness.session.requestCompaction({
++			force: true,
++			continuation: { customType: "semantic-checkpoint", content: "cancel ledger", display: false },
++			resumeOnFailure: true,
++			onError: (error) => {
++				callbackError = error;
++			},
++		});
++		expect(request.accepted).toBe(true);
++		await hookStarted.promise;
++		expect(request.cancel()).toBe(true);
++		releaseHook.resolve();
++		await harness.session.waitForIdle();
++
++		expect(callbackError?.name).toBe("AbortError");
++		expect(harness.faux.state.callCount).toBe(0);
++		expect(harness.sessionManager.getEntries()).not.toContainEqual(
++			expect.objectContaining({ type: "custom_message", customType: "semantic-checkpoint" }),
++		);
++		expect(request.cancel()).toBe(false);
++	});
++
++	it.each(["idle", "active"] as const)(
++		"cancels %s continuation while the persisted compaction hook awaits",
++		async (mode) => {
++			const hookStarted = deferred();
++			const releaseHook = deferred();
++			const errors: Error[] = [];
++			let completions = 0;
++			let cancel = () => false;
++			const options = {
++				force: true,
++				continuation: { customType: "semantic-checkpoint", content: "durable checkpoint" },
++				resumeOnFailure: true,
++				onComplete: () => {
++					completions++;
++				},
++				onError: (error: Error) => {
++					errors.push(error);
++					expect(cancel()).toBe(false);
++				},
++			};
++			const harness = await createHarness({
++				extensionFactories: [
++					(pi) => {
++						pi.on("turn_end", (_event, ctx) => {
++							if (mode !== "active") return;
++							const request = ctx.requestCompaction(options);
++							expect(request.accepted).toBe(true);
++							cancel = request.cancel;
++						});
++						pi.on("session_before_compact", (event) => ({
++							compaction: {
++								summary: "durable summary",
++								firstKeptEntryId: event.preparation.firstKeptEntryId,
++								tokensBefore: event.preparation.tokensBefore,
++							},
++						}));
++						pi.on("session_compact", async () => {
++							hookStarted.resolve();
++							await releaseHook.promise;
++						});
++					},
++				],
++			});
++			harnesses.push(harness);
++			harness.sessionManager.appendMessage({ role: "user", content: "old context", timestamp: Date.now() - 2 });
++			harness.sessionManager.appendMessage(fauxAssistantMessage("old answer", { timestamp: Date.now() - 1 }));
++			harness.session.refreshContext();
++			harness.setResponses([fauxAssistantMessage("completed turn"), fauxAssistantMessage("must not run")]);
++			let prompt: Promise<void> | undefined;
++			if (mode === "idle") {
++				const request = harness.session.requestCompaction(options);
++				expect(request.accepted).toBe(true);
++				cancel = request.cancel;
++			} else {
++				prompt = harness.session.prompt("start");
++			}
++			await hookStarted.promise;
++			expect(cancel()).toBe(true);
++			releaseHook.resolve();
++			await prompt;
++			await harness.session.waitForIdle();
++			expect(errors.map((error) => error.name)).toEqual(["AbortError"]);
++			expect(completions).toBe(0);
++			expect(cancel()).toBe(false);
++			expect(harness.faux.state.callCount).toBe(mode === "idle" ? 0 : 1);
++			expect(harness.sessionManager.getEntries()).toContainEqual(
++				expect.objectContaining({ type: "compaction", summary: "durable summary" }),
++			);
++			expect(harness.sessionManager.getEntries()).toContainEqual(
++				expect.objectContaining({ type: "custom_message", content: "durable checkpoint" }),
++			);
++		},
++	);
++
++	it("settles success before awaiting its completion callback", async () => {
++		const callbackStarted = deferred();
++		const releaseCallback = deferred();
++		const errors: Error[] = [];
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.on("session_before_compact", (event) => ({
++						compaction: {
++							summary: "completed summary",
++							firstKeptEntryId: event.preparation.firstKeptEntryId,
++							tokensBefore: event.preparation.tokensBefore,
++						},
++					}));
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.sessionManager.appendMessage({ role: "user", content: "old context", timestamp: Date.now() - 2 });
++		harness.sessionManager.appendMessage(fauxAssistantMessage("old answer", { timestamp: Date.now() - 1 }));
++		harness.session.refreshContext();
++		harness.setResponses([fauxAssistantMessage("continued")]);
++		const request = harness.session.requestCompaction({
++			force: true,
++			continuation: { customType: "semantic-checkpoint", content: "completed checkpoint" },
++			onComplete: async () => {
++				callbackStarted.resolve();
++				await releaseCallback.promise;
++			},
++			onError: (error) => {
++				errors.push(error);
++			},
++		});
++		await callbackStarted.promise;
++		expect(request.cancel()).toBe(false);
++		releaseCallback.resolve();
++		await harness.session.waitForIdle();
++		expect(errors).toEqual([]);
++		expect(harness.faux.state.callCount).toBe(1);
++	});
++
++	it("settles failed-run intents without changing automatic provider retries", async () => {
++		const errors: Error[] = [];
++		let requested = false;
++		const harness = await createHarness({
++			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
++			extensionFactories: [
++				(pi) => {
++					pi.on("turn_end", (_event, ctx) => {
++						if (requested) return;
++						requested = true;
++						ctx.requestCompaction({
++							continuation: { customType: "semantic-checkpoint", content: "obsolete retry intent" },
++							resumeOnFailure: true,
++							onError: (error) => {
++								errors.push(error);
++							},
++						});
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.setResponses([
++			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
++			fauxAssistantMessage("retry recovered"),
++		]);
++		await harness.session.prompt("start");
++		expect(errors).toHaveLength(1);
++		expect(harness.faux.state.callCount).toBe(2);
++		expect(harness.eventsOfType("compaction_start")).toEqual([]);
++		expect(harness.eventsOfType("auto_retry_end")).toContainEqual(
++			expect.objectContaining({ success: true, attempt: 1 }),
++		);
++		expect(JSON.stringify(harness.sessionManager.getEntries())).not.toContain("obsolete retry intent");
++	});
++
++	it.each(["error", "aborted"] as const)(
++		"settles an accepted intent on provider %s without stranding it",
++		async (stopReason) => {
++			const errors: Error[] = [];
++			let completions = 0;
++			let requested = false;
++			let cancel = () => false;
++			const harness = await createHarness({
++				settings: { retry: { enabled: false }, compaction: { enabled: false } },
++				extensionFactories: [
++					(pi) => {
++						pi.on("turn_end", (_event, ctx) => {
++							if (requested) return;
++							requested = true;
++							const request = ctx.requestCompaction({
++								continuation: { customType: "semantic-checkpoint", content: "obsolete intent" },
++								resumeOnFailure: true,
++								onComplete: () => {
++									completions++;
++								},
++								onError: (error) => {
++									errors.push(error);
++									expect(cancel()).toBe(false);
++								},
++							});
++							expect(request.accepted).toBe(true);
++							cancel = request.cancel;
++						});
++					},
++				],
++			});
++			harnesses.push(harness);
++			harness.setResponses([
++				fauxAssistantMessage("", { stopReason, errorMessage: "provider failed" }),
++				fauxAssistantMessage("fresh answer"),
++			]);
++			await harness.session.prompt("start");
++			expect(errors).toHaveLength(1);
++			expect(errors[0].name).toBe(stopReason === "aborted" ? "AbortError" : "Error");
++			expect(completions).toBe(0);
++			expect(cancel()).toBe(false);
++			expect(harness.faux.state.callCount).toBe(1);
++			expect(harness.eventsOfType("compaction_start")).toEqual([]);
++			await harness.session.prompt("new prompt");
++			expect(harness.faux.state.callCount).toBe(2);
++			expect(errors).toHaveLength(1);
++			expect(harness.eventsOfType("compaction_start")).toEqual([]);
++			expect(JSON.stringify(harness.sessionManager.getEntries())).not.toContain("obsolete intent");
++			const next = harness.session.requestCompaction({
++				force: true,
++				autoResume: false,
++				continuation: { customType: "semantic-checkpoint", content: "fresh intent" },
++			});
++			expect(next.accepted).toBe(true);
++			next.cancel();
++			await harness.session.waitForIdle();
++		},
++	);
++
++	it("cancels an unconsumed semantic compaction request without aborting the active turn", async () => {
++		let accepted = false;
++		let cancelled = false;
++		const harness = await createHarness({
++			extensionFactories: [
++				(pi) => {
++					pi.on("turn_end", (_event, ctx) => {
++						const request = ctx.requestCompaction({
++							continuation: { customType: "semantic-checkpoint", content: "cancelled", display: false },
++						});
++						accepted = request.accepted;
++						cancelled = request.cancel();
++					});
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.setResponses([fauxAssistantMessage("normal completion")]);
++
++		await harness.session.prompt("continue normally");
++
++		expect(accepted).toBe(true);
++		expect(cancelled).toBe(true);
++		expect(harness.faux.state.callCount).toBe(1);
++		expect(harness.eventsOfType("compaction_start")).toEqual([]);
++		expect(
++			harness.sessionManager
++				.getEntries()
++				.some((entry) => entry.type === "custom_message" && entry.customType === "semantic-checkpoint"),
++		).toBe(false);
++	});
++
++	it("pauses a rejected semantic compaction and reports the failure without continuing", async () => {
++		let failures = 0;
++		const harness = await createHarness({
++			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
++			extensionFactories: [
++				(pi) => {
++					pi.on("turn_end", (_event, ctx) => {
++						ctx.requestCompaction({
++							continuation: { customType: "semantic-checkpoint", content: "retry checkpoint", display: false },
++							onError: () => {
++								failures++;
++							},
++						});
++					});
++					pi.on("session_before_compact", () => ({ cancel: true }));
++				},
++			],
++		});
++		harnesses.push(harness);
++		harness.sessionManager.appendMessage({ role: "user", content: "old context", timestamp: Date.now() - 2 });
++		harness.sessionManager.appendMessage(fauxAssistantMessage("old response", { timestamp: Date.now() - 1 }));
++		harness.session.refreshContext();
++		harness.setResponses([fauxAssistantMessage("completed response")]);
++
++		await harness.session.prompt("request");
++
++		expect(failures).toBe(1);
++		expect(harness.faux.state.callCount).toBe(1);
++		expect(
++			harness.session.messages.filter((message) => message.role === "assistant" && message.stopReason === "aborted"),
++		).toHaveLength(0);
++		expect(harness.sessionManager.getEntries()).not.toContainEqual(
++			expect.objectContaining({ type: "custom_message", customType: "semantic-checkpoint" }),
++		);
++	});
++
+ 	it("commits a retain-none turn_end compaction and explicitly continues once", async () => {
+ 		let handled = false;
+ 		const observedIds: string[] = [];
+diff --git a/packages/coding-agent/test/suite/agent-session-compaction.test.ts b/packages/coding-agent/test/suite/agent-session-compaction.test.ts
+index 3f72a3959..b35e9e99a 100644
+--- a/packages/coding-agent/test/suite/agent-session-compaction.test.ts
++++ b/packages/coding-agent/test/suite/agent-session-compaction.test.ts
+@@ -397,7 +397,7 @@ describe("AgentSession compaction characterization", () => {
+ 
+ 	it("notifies extensions when auto-compaction fails", async () => {
+ 		const failedEvents: Array<{
+-			reason: "manual" | "threshold" | "overflow";
++			reason: "manual" | "threshold" | "overflow" | "semantic";
+ 			errorMessage?: string;
+ 			aborted: boolean;
+ 			willRetry: boolean;
+diff --git a/packages/coding-agent/test/suite/regressions/5217-compaction-reason.test.ts b/packages/coding-agent/test/suite/regressions/5217-compaction-reason.test.ts
+index 9af206fe3..4dc4f81f8 100644
+--- a/packages/coding-agent/test/suite/regressions/5217-compaction-reason.test.ts
++++ b/packages/coding-agent/test/suite/regressions/5217-compaction-reason.test.ts
+@@ -9,7 +9,7 @@ type SessionWithCompactionInternals = {
+ 
+ interface RecordedCompactionEvent {
+ 	type: "session_before_compact" | "session_compact";
+-	reason: "manual" | "threshold" | "overflow";
++	reason: "manual" | "threshold" | "overflow" | "semantic";
+ 	willRetry: boolean;
+ }
+ 
+diff --git a/packages/coding-agent/test/trigger-compact-extension.test.ts b/packages/coding-agent/test/trigger-compact-extension.test.ts
+index 930769f37..9587db0dc 100644
+--- a/packages/coding-agent/test/trigger-compact-extension.test.ts
++++ b/packages/coding-agent/test/trigger-compact-extension.test.ts
+@@ -20,6 +20,7 @@ function createContext(tokens: number | null, compact = vi.fn()): ExtensionConte
+ 		shutdown: vi.fn(),
+ 		getContextUsage: () => ({ tokens, contextWindow: 200_000, percent: tokens === null ? null : tokens / 2000 }),
+ 		compact,
++		requestCompaction: () => ({ accepted: false, cancel: () => false }),
+ 		getSystemPrompt: () => "",
+ 	};
+ }

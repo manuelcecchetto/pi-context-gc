@@ -36,3 +36,12 @@ test("resume message is narrow and anchored on next focus", () => {
   assert.match(text, /Redis expiry/);
   assert.match(text, /auth suite passes/);
 });
+
+
+test("recovery checkpoint does not claim compaction succeeded", () => {
+  const text = buildResumeMessage(checkpoint, false);
+  assert.doesNotMatch(text, /compaction completed/);
+  assert.match(text, /without successful compaction/);
+  assert.match(text, /Redis expiry/);
+  assert.match(text, /auth suite passes/);
+});

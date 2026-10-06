@@ -1,8 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  cancelPending,
+  invalidateRuntime,
+  supersedeCheckpoint,
   createRuntimeState,
-  maybeStartAtContextBoundary,
+  maybeStartAtTurnBoundary,
   resumeWithoutCompaction,
   scheduleCheckpoint,
   startCompaction,
@@ -40,7 +43,7 @@ function result(toolCallId) {
 function fixture({ idle = true, pendingMessages = false } = {}) {
   const entries = [];
   const messages = [];
-  const calls = { compact: 0, send: 0 };
+  const calls = { compact: 0, send: 0, cancel: 0 };
   let compactCallbacks;
   const pi = {
     appendEntry(type, data) { entries.push({ type, data }); },
@@ -54,9 +57,11 @@ function fixture({ idle = true, pendingMessages = false } = {}) {
     hasUI: false,
     sessionManager: { getSessionId: () => "session-1" },
     getContextUsage: () => ({ tokens: 100_000, contextWindow: 350_000, percent: 28.57 }),
-    compact(options) {
+    compact() { throw new Error("manual abort path must never be called"); },
+    requestCompaction(options) {
       calls.compact += 1;
       compactCallbacks = options;
+      return { accepted: true, cancel() { calls.cancel++; return true; } };
     },
     isIdle: () => idle,
     hasPendingMessages: () => pendingMessages,
@@ -96,13 +101,13 @@ test("starts only at the complete batch containing the exact checkpoint call", (
   scheduleCheckpoint(f.pi, f.ctx, runtime, "tool-1", input);
 
   assert.equal(
-    maybeStartAtContextBoundary(f.pi, f.ctx, runtime, config, [assistant("other"), result("other")]),
+    maybeStartAtTurnBoundary(f.pi, f.ctx, runtime, config, [assistant("other"), result("other")]),
     false,
   );
   assert.equal(f.calls.compact, 0);
 
   assert.equal(
-    maybeStartAtContextBoundary(f.pi, f.ctx, runtime, config, [assistant("tool-1"), result("tool-1")]),
+    maybeStartAtTurnBoundary(f.pi, f.ctx, runtime, config, [assistant("tool-1"), result("tool-1")]),
     true,
   );
   assert.equal(f.calls.compact, 1);
@@ -112,7 +117,7 @@ test("starts only at the complete batch containing the exact checkpoint call", (
   assert.match(f.callbacks.customInstructions, /phase B/);
 });
 
-test("successful compaction resumes exactly once when Pi is idle", async () => {
+test("successful compaction delegates exactly one continuation and the full ledger to the host", async () => {
   const f = fixture({ idle: true });
   const runtime = createRuntimeState();
   scheduleCheckpoint(f.pi, f.ctx, runtime, "tool-1", input);
@@ -122,9 +127,13 @@ test("successful compaction resumes exactly once when Pi is idle", async () => {
   f.callbacks.onComplete({ tokensBefore: 100_000, estimatedTokensAfter: 20_000 });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(f.calls.send, 1);
+  assert.equal(f.calls.send, 0);
+  assert.equal(f.calls.compact, 1);
+  assert.equal(f.callbacks.autoResume, true);
   assert.equal(runtime.phase, "idle");
-  assert.match(f.messages[0].message.content, /phase B/);
+  assert.match(f.callbacks.continuation.content, /phase B/);
+  assert.match(f.callbacks.continuation.content, /old path/);
+  assert.match(f.callbacks.continuation.content, /acceptance criteria pass/);
 });
 
 
@@ -140,6 +149,8 @@ test("autoResume false keeps the completed checkpoint resumable", async () => {
 
   assert.equal(f.calls.send, 0);
   assert.equal(runtime.phase, "resume-pending");
+  assert.equal(f.callbacks.autoResume, false);
+  assert.match(f.callbacks.continuation.content, /old path/);
   assert.equal(resumeWithoutCompaction(
     f.pi,
     f.ctx,
@@ -185,4 +196,89 @@ test("stale session prevents compaction", () => {
   assert.equal(startCompaction(f.pi, f.ctx, runtime, config), false);
   assert.equal(f.calls.compact, 0);
   assert.equal(runtime.phase, "failed");
+});
+
+
+test("queued background notifications never suppress the canonical ledger or add a resume turn", () => {
+  const f = fixture({ idle: false, pendingMessages: true });
+  const runtime = createRuntimeState();
+  scheduleCheckpoint(f.pi, f.ctx, runtime, "tool-1", input);
+  startCompaction(f.pi, f.ctx, runtime, config);
+  f.callbacks.onComplete({ tokensBefore: 100_000, estimatedTokensAfter: 20_000 });
+  assert.equal(f.calls.send, 0);
+  assert.match(f.callbacks.continuation.content, /old path/);
+  assert.equal(runtime.phase, "idle");
+});
+
+test("resumeOnFailure delegates recovery to host instead of creating a competing prompt", () => {
+  const f = fixture();
+  const runtime = createRuntimeState();
+  scheduleCheckpoint(f.pi, f.ctx, runtime, "tool-1", input);
+  startCompaction(f.pi, f.ctx, runtime, { ...config, resumeOnFailure: true });
+  assert.equal(f.callbacks.resumeOnFailure, true);
+  f.callbacks.onError(new Error("remote unavailable"));
+  assert.equal(f.calls.send, 0);
+  assert.equal(runtime.phase, "idle");
+  assert.doesNotMatch(f.callbacks.continuation.content, /compaction completed/);
+});
+
+test("cancel clears queued intent and rejects late callbacks", () => {
+  const f = fixture();
+  const runtime = createRuntimeState();
+  scheduleCheckpoint(f.pi, f.ctx, runtime, "tool-1", input);
+  startCompaction(f.pi, f.ctx, runtime, config);
+  assert.equal(cancelPending(f.pi, f.ctx, runtime, config, "new input"), true);
+  f.callbacks.onComplete({ tokensBefore: 100_000 });
+  assert.equal(f.calls.cancel, 1);
+  assert.equal(runtime.phase, "idle");
+  assert.equal(runtime.lastCompletedCheckpointId, undefined);
+  assert.equal(f.entries.at(-1).data.status, "cancelled");
+});
+
+test("shutdown cancels queued host request and invalidates callbacks", () => {
+  const f = fixture();
+  const runtime = createRuntimeState();
+  scheduleCheckpoint(f.pi, f.ctx, runtime, "tool-1", input);
+  startCompaction(f.pi, f.ctx, runtime, config);
+  invalidateRuntime(runtime);
+  f.callbacks.onError(new Error("late failure"));
+  assert.equal(f.calls.cancel, 1);
+  assert.equal(runtime.phase, "idle");
+  assert.equal(runtime.lastError, undefined);
+});
+
+test("host refusal leaves a recoverable checkpoint without a legacy fallback", () => {
+  const f = fixture();
+  f.ctx.requestCompaction = () => ({ accepted: false, cancel: () => false });
+  const runtime = createRuntimeState();
+  scheduleCheckpoint(f.pi, f.ctx, runtime, "tool-1", input);
+  assert.equal(startCompaction(f.pi, f.ctx, runtime, config), false);
+  assert.equal(runtime.phase, "failed");
+  assert.equal(f.calls.send, 0);
+});
+
+
+test("new user intent supersedes a paused checkpoint", () => {
+  const f = fixture();
+  const runtime = createRuntimeState();
+  scheduleCheckpoint(f.pi, f.ctx, runtime, "tool-1", input);
+  startCompaction(f.pi, f.ctx, runtime, { ...config, autoResume: false });
+  f.callbacks.onComplete({ tokensBefore: 100_000 });
+  assert.equal(runtime.phase, "resume-pending");
+  supersedeCheckpoint(f.pi, f.ctx, runtime, config);
+  assert.equal(runtime.phase, "idle");
+  assert.equal(runtime.checkpoint, undefined);
+  assert.equal(f.entries.at(-1).data.status, "cancelled");
+});
+
+
+test("cancellation remains recoverable and never invokes failure auto-resume", () => {
+  const f = fixture();
+  const runtime = createRuntimeState();
+  scheduleCheckpoint(f.pi, f.ctx, runtime, "tool-1", input);
+  startCompaction(f.pi, f.ctx, runtime, { ...config, resumeOnFailure: true });
+  f.callbacks.onError(new DOMException("Compaction cancelled", "AbortError"));
+  assert.equal(runtime.phase, "failed");
+  assert.equal(f.calls.send, 0);
+  assert.equal(runtime.checkpoint.toolCallId, "tool-1");
 });

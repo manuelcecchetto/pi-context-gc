@@ -1,5 +1,7 @@
 # Research notes and source map
 
+> Historical design record for the original Pi 0.84.x abort/resume implementation. The current unreleased design requires atomic `requestCompaction`; see [ARCHITECTURE.md](ARCHITECTURE.md) and [COMPATIBILITY.md](COMPATIBILITY.md). The lifecycle descriptions below are not current implementation guidance.
+
 Research date: 2026-08-20.
 
 ## Pi

@@ -7,40 +7,24 @@ npm install
 npm run check
 ```
 
-The current suite contains 17 tests covering:
+The offline scheduler suite covers capability rejection on stock hosts, whole-batch validation and exact checkpoint matching, runtime-owned continuation with queued notifications, canonical ledger handoff, duplicate/stale callbacks, manual pause/recovery, failure policy, cancellation and real extension loading. Run the current suite instead of relying on a historical test count.
 
-1. extension/tool/command registration;
-2. sequential execution declaration;
-3. real-user-input cancellation;
-4. `agent_settled` fallback with the same persisted complete-batch invariant;
-5. complete and incomplete parallel tool batches;
-6. duplicate, missing and unrelated tool result IDs;
-7. exact checkpoint tool-call matching;
-8. task/search/completion guidance content;
-9. exactly-once resume after successful compaction;
-10. full canonical ledger in the resume message;
-11. no duplicate turn when Pi is not idle;
-12. pending-message continuation ownership;
-13. `autoResume=false` leaving a resumable `resume-pending` state;
-14. failure pause and explicit full-ledger recovery;
-15. stale-session callback rejection;
-16. compact callback idempotence;
-17. checkpoint scheduling busy rejection.
+## Runtime boundary regression (required)
 
-## Validation performed for this artifact
+Scheduler mocks cannot prove atomicity. In the matching Pi source tree, use a faux provider and a gated `session_before_compact` hook:
 
-On 2026-08-20:
+1. Model emits a checkpoint tool and a deliberately delayed sibling tool.
+2. Confirm compaction cannot start until both results are persisted.
+3. Hold the compaction backend open, complete independent background work and enqueue its notification.
+4. Confirm no new parent provider call, abort assistant or artificial `agent_settled` occurs while compaction is blocked.
+5. Release the backend; assert the first provider input contains replacement history plus exactly one canonical ledger, and the notification is retained.
+6. Repeat with failure, real abort, session replacement, manual pause and explicit resume. Assert no hidden retry/duplicate continuation or stale checkpoint installation.
 
-- strict TypeScript typecheck passed against a local compatibility surface modeled on Pi 0.84.2 APIs;
-- build passed;
-- all 17 unit tests passed;
-- the source package file list was inspected; a final npm tarball with the real bundled backend was not built because registry access was unavailable.
-
-A live Pi/OpenAI request was not executed in the build environment because npm registry/network access and user credentials were unavailable. The live smoke test below is therefore still required before treating the package as production-ready.
+Use only deterministic local/faux providers for this regression. Live providers are a separate opt-in smoke test, not a prerequisite for offline tests.
 
 ## Live Pi smoke test
 
-Use a project-local install and a supported OpenAI model.
+Use a host implementing `requestCompaction`, a project-local scheduler install, and a supported OpenAI model. Restart the runtime after installing core changes. Stock Pi 1.0.0 must reject the tool without entering the aborting manual path.
 
 ```bash
 cd /absolute/path/to/pi-context-gc
@@ -65,7 +49,9 @@ Expected observations:
 - native details contain the backend strategy/opaque compacted window on supported APIs;
 - a session below the configured `keepRecentTokens` budget still reaches native compaction through the forced extension request;
 - ChatGPT-authenticated Codex uses the regular Responses stream with `compaction_trigger` when the standalone compact route returns 404;
-- the next phase receives one hidden canonical checkpoint;
+- the next phase receives one hidden canonical checkpoint before any resumed model call;
+- a background subagent remains running during compaction and its eventual notification is delivered;
+- there is no synthetic aborted assistant and no competing parent continuation;
 - prior raw exploration is not repeated without new evidence;
 - exact current file details are re-read only when needed.
 
@@ -88,7 +74,7 @@ Expected:
 
 ## User steer race
 
-While the model is about to call `compact_context`, send a real steering message before the next context boundary.
+While the model is about to call `compact_context`, send a real steering message before the next turn boundary.
 
 Expected: pending semantic GC is cancelled because the relevance graph changed.
 
@@ -129,3 +115,7 @@ Measure:
 - recall of decisions, invariants, open loops, ruled-out paths and verification state.
 
 Fewer tokens alone are not success. The central hypothesis is improved live-context quality without loss of task state.
+
+## Built-package smoke details
+
+Test the packed host outside its source tree, not only source aliases. For a credential-free SDK fixture, use temporary `authPath`/`modelsPath`, disable model networking, and use the faux provider. Explicitly activate `compact_context`: `tools: []` excludes extension tools too. Bind extensions with `session.bindExtensions({})`. A gated fake compaction backend lets the test assert that background work completes while the parent is blocked, then verify the persisted checkpoint and notification after release. Preserve installed native-backend fixes while overlaying scheduler changes; run that installation's complete suite against the candidate host.

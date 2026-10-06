@@ -6,16 +6,18 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { loadConfig } from "./config.ts";
+import { hasBoundaryCompaction } from "./host.ts";
 import {
   cancelPending,
   createRuntimeState,
   formatRuntimeStatus,
   invalidateRuntime,
-  maybeStartAtContextBoundary,
+  maybeStartAtTurnBoundary,
   resetRuntime,
   resumeCheckpoint,
   scheduleCheckpoint,
   startCompaction,
+  supersedeCheckpoint,
 } from "./runtime.ts";
 import {
   COMMAND_NAME,
@@ -182,6 +184,13 @@ export function createContextGcExtension(): (pi: ExtensionAPI) => void {
           };
         }
 
+        if (!hasBoundaryCompaction(ctx)) {
+          return {
+            content: [{ type: "text", text: "Context GC requires Pi's requestCompaction boundary API. This host is unsupported; no compaction was requested." }],
+            details: { accepted: false, reason: "host lacks requestCompaction" },
+          };
+        }
+
         const result = scheduleCheckpoint(pi, ctx, runtime, toolCallId, params);
         if (!result.ok) {
           return {
@@ -208,36 +217,19 @@ export function createContextGcExtension(): (pi: ExtensionAPI) => void {
       },
     });
 
-    pi.on("context", (event, ctx) => {
+    pi.on("turn_end", (event, ctx) => {
       const loaded = getLoaded(ctx);
-      maybeStartAtContextBoundary(pi, ctx, runtime, loaded.config, event.messages);
-    });
-
-    // Fallback safe point: a tool call should normally create another context
-    // event, but if another extension terminates the run first, compact from idle.
-    pi.on("agent_settled", (_event, ctx) => {
-      const loaded = getLoaded(ctx);
-      if (runtime.phase !== "pending" || !ctx.isIdle()) return;
-
-      // Never bypass the complete-batch invariant, even on the idle fallback.
-      // Session context is authoritative here because all message_end persistence
-      // has completed before agent_settled is emitted.
-      try {
-        const messages = ctx.sessionManager
-          .buildContextEntries()
-          .flatMap((entry) => entry.type === "message" ? [entry.message] : []);
-        maybeStartAtContextBoundary(pi, ctx, runtime, loaded.config, messages);
-      } catch {
-        // Leave the checkpoint pending rather than compacting an unverified tail.
-      }
+      // turn_end runs after every message_end has persisted. Request here, not
+      // in context (which is too late: the host already prepared that turn).
+      maybeStartAtTurnBoundary(pi, ctx, runtime, loaded.config, [event.message, ...event.toolResults]);
     });
 
     // A real user steer changes the dependency graph. Do not compact against a
     // checkpoint produced before that instruction.
     pi.on("input", (event, ctx) => {
-      if (runtime.phase !== "pending" || event.source === "extension") return;
+      if (event.source === "extension") return;
       const loaded = getLoaded(ctx);
-      cancelPending(pi, ctx, runtime, loaded.config, "new user input arrived before compaction");
+      supersedeCheckpoint(pi, ctx, runtime, loaded.config);
     });
 
     pi.on("session_shutdown", (_event, ctx) => {

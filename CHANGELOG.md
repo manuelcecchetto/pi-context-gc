@@ -9,6 +9,11 @@
 
 ## Unreleased
 
+- Require Pi's explicit `requestCompaction` host capability; reject unsupported hosts without an abort/resume fallback.
+- Request compaction at `turn_end`, preserving whole batches and delegating atomic history/ledger installation and single continuation to Pi.
+- Keep background subagents independent and retain canonical checkpoints with queued notifications.
+- Remove event-loop-delayed automatic resumes; add cancellation, stale-callback, host-refusal and recovery-ledger regressions.
+
 - Force explicit semantic compaction past Pi's `keepRecentTokens` eligibility gate without changing automatic or overflow retention behavior.
 - Fall back to Codex remote-compaction v2 when the ChatGPT standalone compact endpoint returns 404.
 - Preserve automatic checkpoint resume after native compaction.

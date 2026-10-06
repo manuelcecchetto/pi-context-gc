@@ -27,7 +27,8 @@
     "test",
     "tsconfig.json",
     "tsconfig.build.json",
-    "vendor"
+    "vendor",
+    "patches"
   ],
   "pi": {
     "extensions": [
@@ -42,13 +43,13 @@
     "check": "npm run typecheck && npm test"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.84.0",
+    "@earendil-works/pi-coding-agent": ">=1.0.0",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.84.2",
-    "@earendil-works/pi-ai": "0.84.2",
-    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-agent-core": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0",
     "typebox": "1.3.7"

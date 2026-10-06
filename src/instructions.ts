@@ -26,11 +26,13 @@ export function buildCompactionInstructions(checkpoint: ContextCheckpoint): stri
   ].join("\n");
 }
 
-export function buildResumeMessage(checkpoint: ContextCheckpoint): string {
+export function buildResumeMessage(checkpoint: ContextCheckpoint, compacted?: boolean): string {
   const { input } = checkpoint;
   return [
     "[pi-context-gc/task-state-v1]",
-    "The semantic phase-boundary compaction completed. This is the canonical live task/search checkpoint for the next phase.",
+    compacted === false
+      ? "Continuing without successful compaction. This is the canonical live task/search checkpoint for the next phase."
+      : "This is the canonical live task/search checkpoint for the next phase.",
     `Completed phase: ${input.completed_phase}`,
     `Current focus: ${input.next_focus}`,
     section("Durable state", input.keep),

@@ -55,3 +55,7 @@ SOFTWARE.
 ## Vendored modification
 
 The copy under `vendor/pi-better-compaction` is based on npm 0.2.1 and changes only `src/compact-client.ts` to add the experimental Codex streaming fallback described in `docs/COMPATIBILITY.md`. Its original MIT LICENSE is retained alongside the source.
+
+## Companion Pi runtime patch
+
+`patches/pi-1.0.0-semantic-compaction.patch` contains modifications and context from earendil-works/pi v1.0.0. Upstream is MIT licensed, copyright (c) 2025 Mario Zechner. The full upstream notice is retained in `patches/PI-LICENSE`. See `patches/README.md` for the exact base commit and provenance.

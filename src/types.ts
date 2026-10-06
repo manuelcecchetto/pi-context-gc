@@ -51,6 +51,7 @@ export interface RuntimeState {
   checkpoint: ContextCheckpoint | undefined;
   lastError: string | undefined;
   lastCompletedCheckpointId: string | undefined;
+  cancelRequest: (() => boolean) | undefined;
 }
 
 export interface CompleteToolBatch {

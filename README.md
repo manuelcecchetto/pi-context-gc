@@ -2,7 +2,9 @@
 
 Agent-triggered semantic context garbage collection for Pi.
 
-`pi-context-gc` gives the model one explicit tool, `compact_context`, for declaring that a coherent phase is complete and its raw working set is no longer useful. It records a bounded task/search/completion checkpoint, waits for the complete tool-result batch, enters Pi's standard compaction lifecycle with a requested forced-preparation hint, and resumes the task from a hidden canonical ledger. The `force: true` hint requires host support; stock Pi 0.84.2 ignores it, so its usual `keepRecentTokens` eligibility gate still applies. The package does not patch the host. See [compatibility and local changes](docs/COMPATIBILITY.md).
+`pi-context-gc` gives the model `compact_context` for declaring a coherent phase complete. It records a bounded checkpoint, waits for the complete tool-result batch, and asks Pi to compact **between model turns without aborting the parent**. Background subagents keep running. Pi persists the canonical ledger before continuing the same parent run.
+
+**This unreleased scheduler requires a Pi host implementing `ctx.requestCompaction`. Stock Pi 1.0.0 does not implement it.** Unsupported hosts reject the tool request rather than silently using the old abort/resume path. Updating this extension alone is not enough. The [companion runtime patch](patches/README.md) is included; see [compatibility and local changes](docs/COMPATIBILITY.md).
 
 The package manifest loads the vendored `@lll9p/pi-better-compaction` 0.2.1 with a documented local patch extension before the semantic scheduler. Supported OpenAI Responses models therefore use `/responses/compact`; ChatGPT-authenticated Codex models fall back from the unavailable standalone route to Codex remote-compaction v2 (`compaction_trigger` on the regular Responses stream). Both paths persist opaque compacted state. If native handling cannot run, the backend fails open to Pi's normal text compaction. Pi's existing threshold and context-overflow compaction remain untouched, including their configured `keepRecentTokens` behavior.
 
@@ -24,9 +26,11 @@ long Pi agent run
                     |
         complete tool batch is persisted
                     |
-          Pi `context` safe boundary
+        Pi `turn_end` request boundary
                     |
-              ctx.compact()
+         ctx.requestCompaction()
+                    |
+       pre-provider compaction boundary
                     |
        session_before_compact lifecycle
           /                         \
@@ -65,39 +69,25 @@ Pi owns persistence, threshold and overflow safety
 ## Requirements
 
 - Node `>=22.19.0`
-- Pi `@earendil-works/pi-coding-agent >=0.84.0`
+- Pi `@earendil-works/pi-coding-agent >=1.0.0` **with `ctx.requestCompaction` support** (unreleased host change)
 - a working OpenAI Responses/Codex model for opaque native compaction
 
 Other providers can still use Pi's normal compaction fallback.
 
-## Install
+## Try this feature branch
+
+This branch is not a stock-Pi-compatible release. First build/install the [companion runtime change](patches/README.md), then load the scheduler separately:
 
 ```bash
-pi install git:github.com/manuelcecchetto/pi-context-gc
+git clone --branch fix/atomic-semantic-compaction https://github.com/manuelcecchetto/pi-context-gc.git
+cd pi-context-gc
+npm ci --ignore-scripts
+pi -e "$PWD/scheduler-only.ts"
 ```
 
-Or clone and install locally:
+Use Pi's standard text compaction or a separately compatible native backend. Do not also load another copy of the semantic scheduler. The repository's older bundled backend was not upgraded here; the newer native backend used in local activation is separate. Do not replace an existing newer vendor directory with this one.
 
-```bash
-cd /absolute/path/to/pi-context-gc
-npm install
-pi install "$PWD"
-```
-
-Project-local evaluation from the repository where the agent will work:
-
-```bash
-cd /absolute/path/to/target-repository
-pi install -l /absolute/path/to/pi-context-gc
-```
-
-Restart Pi or run:
-
-```text
-/reload
-```
-
-Do not separately load `@lll9p/pi-better-compaction` when installing the package directory: the package manifest already loads its vendored extension resource. To combine only the scheduler with another `session_before_compact` backend, load `scheduler-only.ts` directly instead of installing the whole package.
+A runtime update requires a fresh Pi process, not merely `/reload`. Extension-only changes can use `/reload` after the capable runtime is running. The ordinary `main` branch remains unchanged by this experimental branch.
 
 ## `compact_context`
 
@@ -137,29 +127,15 @@ The schema is deliberately bounded so the checkpoint cannot become another trans
 
 The model is instructed not to call the tool merely because context is large, while hypotheses are unresolved, or immediately before its final answer.
 
-## Why compaction starts from `context`
+## Safe boundary and continuation
 
-Calling `ctx.compact()` inside the tool would abort the active run before Pi had necessarily persisted that result and any sibling results. The tool only records intent.
+The tool records intent and returns normally. At `turn_end`, the extension verifies that every call in the completed batch has exactly one finalized result, including the exact checkpoint call. It then calls `ctx.requestCompaction`; Pi consumes that request before the next provider call, using the normal `session_before_compact` backend and persistence pipeline.
 
-On the next `context` event, the extension verifies that the tail contains one complete assistant/tool-result batch and that the exact checkpoint call has one finalized result. An `agent_settled` fallback reads persisted context entries and applies the same invariant.
+The parent stays logically active during compaction. Background workers are neither cancelled nor awaited. Their completion messages follow Pi's normal queue semantics; they cannot start a competing parent run during replacement-history installation. The host persists one hidden canonical task/search/completion ledger before continuing. The extension does not send a second automatic resume prompt or rely on event-loop timing.
 
-This is the nearest public Pi equivalent of a mid-run post-tool boundary.
+The ledger includes the completed phase, next focus, durable decisions, open loops, ruled-out paths and verification evidence. It remains present even when notifications are queued. Native state supplies broader continuity; neither mechanism guarantees lossless compaction.
 
-## Resume behavior
-
-Pi manual compaction aborts the low-level run and does not continue it. After success, the extension waits one event-loop turn, verifies session/generation/checkpoint identity, checks `ctx.isIdle()` and `ctx.hasPendingMessages()`, then injects one hidden canonical checkpoint with `triggerTurn: true`.
-
-The resume message includes:
-
-- completed phase and current focus;
-- durable state;
-- open loops;
-- ruled-out paths;
-- verification/completion evidence.
-
-The opaque compaction item carries broader provider-native continuity. The explicit ledger helps preserve the next working state, but its accuracy depends on the model; compaction is not guaranteed lossless.
-
-If another turn already owns continuation, no duplicate turn is created. With `autoResume=false`, state remains resumable via `/context-gc resume`.
+With `autoResume=false`, Pi ends the current loop after persisting the ledger; this is not a global lock against later user input or independent extension triggers. Total failure pauses by default; `resumeOnFailure=true` opts into host-owned continuation without successful compaction. `/context-gc resume` explicitly re-materializes the full checkpoint. Ledger text does not falsely claim compaction succeeded on a recovery path.
 
 ## Commands
 
