@@ -38,21 +38,21 @@ const CompactContextParameters = Type.Object(
       maxLength: 2000,
       description: "The exact next subtask or working set to continue after compaction.",
     }),
-    keep: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), {
+    keep: Type.Array(Type.String({ minLength: 1 }), {
       minItems: 1,
       maxItems: 16,
       description: "Durable decisions, invariants, changed files, identifiers, constraints, and facts the next phase needs.",
     }),
     open_loops: Type.Optional(
-      Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { maxItems: 12 }),
+      Type.Array(Type.String({ minLength: 1 }), { maxItems: 12 }),
     ),
     ruled_out: Type.Optional(
-      Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), {
+      Type.Array(Type.String({ minLength: 1 }), {
         maxItems: 12,
         description: "Investigated paths that should not be repeated without new evidence.",
       }),
     ),
-    verification: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), {
+    verification: Type.Array(Type.String({ minLength: 1 }), {
       minItems: 1,
       maxItems: 12,
       description: "Concrete evidence that the completed phase is done: tests, checks, acceptance criteria, or validated conclusions. Put remaining failures in open_loops.",

@@ -44,4 +44,4 @@ Manual recovery injects the full checkpoint, not only `next_focus`. Recovery tex
 
 The bundled MIT `pi-better-compaction` backend remains unchanged: Responses native compaction, documented Codex remote-compaction fallback, then Pi text fallback. The scheduler never handles provider credentials or implements another summarizer.
 
-Checkpoint bounds: completed phase/next focus up to 2,000 characters; 1–16 durable items; 1–12 verification items; up to 12 open loops and ruled-out paths; list items up to 1,000 characters. These are handoff facts, never raw logs or whole files.
+Checkpoint bounds: completed phase/next focus up to 2,000 characters; 1–16 durable items; 1–12 verification items; up to 12 open loops and ruled-out paths. List items have no length cap. These are handoff facts, never raw logs or whole files.
